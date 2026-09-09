@@ -36,30 +36,39 @@ public partial class OktaVerifyAppLauncher(ILogger<OktaVerifyAppLauncher> logger
 
         try
         {
+            if (OperatingSystem.IsWindows() && TryLaunchWindowsExecutable(uri))
+                return true;
+
             var startInfo = CreateStartInfo(uri);
 
             using var process = Process.Start(startInfo);
 
-            if (process is null)
-                return false;
-
-            if (OperatingSystem.IsWindows())
+            if (DidProtocolLaunch(process, OperatingSystem.IsWindows()))
                 return true;
 
-            // 'open' / 'xdg-open' exit with a non-zero code when no application handles the URI scheme
-            return process.WaitForExit(TimeSpan.FromSeconds(10)) && process.ExitCode == 0;
+            if (OperatingSystem.IsWindows() && TryLaunchViaCmdStart(uri))
+                return true;
+
+            return false;
         }
         catch (Exception e) when (e is Win32Exception or InvalidOperationException or IOException or PlatformNotSupportedException)
         {
             logger.LogWarning(e, "Unable to launch Okta Verify using URI scheme {Scheme}", uri.Split(':')[0]);
 
-            return false;
+            return OperatingSystem.IsWindows() && TryLaunchViaCmdStart(uri);
         }
     }
 
     public static bool IsOktaVerifyDeepLink(string uri) =>
         Uri.TryCreate(uri, UriKind.Absolute, out var parsed)
         && string.Equals(parsed.Scheme, OktaVerifyScheme, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    ///     ShellExecute of a custom URI often returns null when the handler is an already-running
+    ///     process (Okta Verify lives in the Windows tray). That is success, not failure.
+    /// </summary>
+    public static bool DidProtocolLaunch(Process? process, bool windows) =>
+        process is not null || windows;
 
     /// <summary>
     ///     Finds an Okta Verify custom-URI deep link in a redirect Location header or in HTML returned by
@@ -86,7 +95,7 @@ public partial class OktaVerifyAppLauncher(ILogger<OktaVerifyAppLauncher> logger
     private static ProcessStartInfo CreateStartInfo(string uri)
     {
         if (OperatingSystem.IsWindows())
-            return new ProcessStartInfo(uri) { UseShellExecute = true };
+            return new ProcessStartInfo { FileName = uri, UseShellExecute = true };
 
         var launcher = OperatingSystem.IsMacOS() ? "open" : "xdg-open";
 
@@ -98,4 +107,123 @@ public partial class OktaVerifyAppLauncher(ILogger<OktaVerifyAppLauncher> logger
             RedirectStandardError = true
         };
     }
+
+    /// <summary>
+    ///     Okta Verify on Windows is started as <c>Okta Verify.exe --URI com-okta-authenticator:...</c>.
+    ///     That accepts a long challenge JWT; ShellExecute of the raw URI often does not.
+    /// </summary>
+    private bool TryLaunchWindowsExecutable(string uri)
+    {
+        foreach (var exe in EnumerateOktaVerifyExecutables())
+        {
+            try
+            {
+                var startInfo = new ProcessStartInfo(exe, ["--URI", uri])
+                {
+                    UseShellExecute = false
+                };
+
+                using var process = Process.Start(startInfo);
+
+                if (process is not null)
+                {
+                    logger.LogDebug("Launched Okta Verify executable {Path}", exe);
+
+                    return true;
+                }
+            }
+            catch (Exception e) when (e is Win32Exception or InvalidOperationException or IOException)
+            {
+                logger.LogDebug(e, "Could not start Okta Verify at {Path}", exe);
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryLaunchViaCmdStart(string uri)
+    {
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo("cmd.exe", ["/c", "start", "", uri])
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+
+            return DidProtocolLaunch(process, windows: true);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    private static IEnumerable<string> EnumerateOktaVerifyExecutables()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var candidate in WellKnownOktaVerifyPaths().Concat(OktaVerifyPathsFromRegistry()))
+        {
+            if (seen.Add(candidate) && File.Exists(candidate))
+                yield return candidate;
+        }
+    }
+
+    private static IEnumerable<string> WellKnownOktaVerifyPaths()
+    {
+        yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Okta", "Okta Verify", "Okta Verify.exe");
+        yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Okta", "Okta Verify", "Okta Verify.exe");
+        yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Okta", "Okta Verify", "Okta Verify.exe");
+    }
+
+    private static IEnumerable<string> OktaVerifyPathsFromRegistry()
+    {
+        if (!OperatingSystem.IsWindows())
+            yield break;
+
+        foreach (var command in ReadOktaVerifyProtocolCommands())
+        {
+            var exe = TryParseExecutableFromCommand(command);
+
+            if (exe is not null)
+                yield return exe;
+        }
+    }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static IEnumerable<string> ReadOktaVerifyProtocolCommands()
+    {
+        string[] keys =
+        [
+            @"Software\Classes\com-okta-authenticator\shell\open\command",
+            @"com-okta-authenticator\shell\open\command"
+        ];
+
+        foreach (var hive in new[] { Microsoft.Win32.Registry.CurrentUser, Microsoft.Win32.Registry.LocalMachine, Microsoft.Win32.Registry.ClassesRoot })
+        {
+            foreach (var key in keys)
+            {
+                using var subKey = hive.OpenSubKey(key);
+
+                if (subKey?.GetValue(null) is string command && command.Length > 0)
+                    yield return command;
+            }
+        }
+    }
+
+    public static string? TryParseExecutableFromCommand(string command)
+    {
+        var match = QuotedPathRegex().Match(command);
+
+        if (match.Success)
+            return match.Groups["path"].Value;
+
+        var first = command.Trim().Split(' ', 2)[0];
+
+        return first.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? first : null;
+    }
+
+    [GeneratedRegex("""^"(?<path>[^"]+\.exe)" """, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex QuotedPathRegex();
 }

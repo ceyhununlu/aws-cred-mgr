@@ -178,161 +178,14 @@ public class OktaIdxAuthenticatorTests
     }
 
     [Fact]
-    public async Task AuthenticateAsync_WhenLoopbackCancelReturnsRedirectIdp_ShouldFollowSameOriginRedirectAndCompleteFastPass()
+    public async Task AuthenticateAsync_WhenChallengeHandlerReturnsRedirectIdp_ShouldNotGetTheBrowserUrl()
     {
-        // Windows: cancelling the loopback probe yields redirect-idp (Mac yields launch-authenticator)
+        // GET /sso/idps expires the IDX session in this CLI ("The session has expired")
         const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
 
         _oktaHandler
             .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .OnJson(HttpMethod.Get, RedirectIdpUrl, IdxPayloads.DeviceChallengePollCustomUri);
-
-        _challengeHandler
-            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
-            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpFastPass), IdxResponse.Parse(IdxPayloads.Success));
-
-        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
-
-        result.Authenticated.ShouldBeTrue();
-        result.SessionId.ShouldBe("102sid");
-        _oktaHandler.RequestsTo(HttpMethod.Get, RedirectIdpUrl).ShouldHaveSingleItem();
-        await _challengeHandler.Received(2).ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>());
-    }
-
-    [Fact]
-    public async Task AuthenticateAsync_WhenRedirectIdpReturnsOktaVerifyDeepLink_ShouldLaunchAppAndCompleteSession()
-    {
-        const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
-        const string DeepLink = "com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.windows.jwt";
-
-        _oktaHandler
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .On(HttpMethod.Get, RedirectIdpUrl, _ => Task.FromResult(FakeHttpMessageHandler.Redirect(DeepLink)))
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.Success);
-
-        _challengeHandler
-            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
-            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpFastPass));
-
-        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
-
-        result.Authenticated.ShouldBeTrue();
-        result.SessionId.ShouldBe("102sid");
-        _appLauncher.Received(1).TryLaunch(DeepLink);
-        _console.Output.ShouldContain("Okta Verify");
-    }
-
-    [Fact]
-    public async Task AuthenticateAsync_WhenRedirectIdpReturnsHtmlWithStateToken_ShouldIntrospectAndCompleteFastPass()
-    {
-        // real Windows orgs serve the Sign-In Widget HTML from /sso/idps/{id}, not Ion JSON
-        const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
-        const string Html = """<html><script>var stateToken = '02html-state-token';</script></html>""";
-
-        _oktaHandler
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .On(HttpMethod.Get, RedirectIdpUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(Html)))
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.DeviceChallengePollCustomUri);
-
-        _challengeHandler
-            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
-            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpFastPass), IdxResponse.Parse(IdxPayloads.Success));
-
-        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
-
-        result.Authenticated.ShouldBeTrue();
-        result.SessionId.ShouldBe("102sid");
-
-        var introspects = _oktaHandler.RequestsTo(HttpMethod.Post, IntrospectUrl).ToList();
-        introspects.Count.ShouldBe(2);
-        Body(introspects[1])["stateToken"]!.GetValue<string>().ShouldBe("02html-state-token");
-    }
-
-    [Fact]
-    public async Task AuthenticateAsync_WhenRedirectIdpReturnsHtmlWithChallengeRequest_ShouldLaunchOktaVerify()
-    {
-        const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
-        const string Html =
-            """<html><script>var okta = {"challengeRequest":"eyJraWQ.html.jwt"};</script></html>""";
-
-        _oktaHandler
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .On(HttpMethod.Get, RedirectIdpUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(Html)))
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.Success);
-
-        _challengeHandler
-            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
-            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpFastPass));
-
-        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
-
-        result.Authenticated.ShouldBeTrue();
-        _appLauncher.Received(1).TryLaunch("com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.html.jwt");
-    }
-
-    [Fact]
-    public async Task AuthenticateAsync_WhenRedirectIdpReturnsHtmlWithEmbeddedIdx_ShouldContinueFastPass()
-    {
-        const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
-        var html = $"<html><script>window.__oktaIdxResponse = {IdxPayloads.DeviceChallengePollCustomUri};</script></html>";
-
-        _oktaHandler
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .On(HttpMethod.Get, RedirectIdpUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(html)));
-
-        _challengeHandler
-            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
-            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpFastPass), IdxResponse.Parse(IdxPayloads.Success));
-
-        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
-
-        result.Authenticated.ShouldBeTrue();
-        await _challengeHandler.Received(2).ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>());
-    }
-
-    [Fact]
-    public async Task AuthenticateAsync_WhenRedirectIdpReturnsHtmlInterstitial_ShouldIntrospectExistingStateAndComplete()
-    {
-        // GET /sso/idps sets cookies; the transaction then continues from the existing state handle
-        const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
-        const string Html = "<html><body>Opening Okta Verify...</body></html>";
-
-        _oktaHandler
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .On(HttpMethod.Get, RedirectIdpUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(Html)))
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.DeviceChallengePollCustomUri);
-
-        _challengeHandler
-            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
-            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpFastPass), IdxResponse.Parse(IdxPayloads.Success));
-
-        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
-
-        result.Authenticated.ShouldBeTrue();
-
-        var introspects = _oktaHandler.RequestsTo(HttpMethod.Post, IntrospectUrl).ToList();
-        introspects.Count.ShouldBe(2);
-        Body(introspects[1])["stateHandle"]!.GetValue<string>().ShouldBe(IdxPayloads.StateHandle);
-        _oktaHandler.RequestsTo(HttpMethod.Get, RedirectIdpUrl).ShouldHaveSingleItem();
-    }
-
-    [Fact]
-    public async Task AuthenticateAsync_WhenRedirectIdpHtmlCannotBeResolved_ShouldThrowWithoutLooping()
-    {
-        const string RedirectIdpUrl = "https://xyz.okta.com/sso/idps/0oa-fastpass";
-        const string Html = "<html><body>no challenge</body></html>";
-
-        _oktaHandler
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
-            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
-            .On(HttpMethod.Get, RedirectIdpUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(Html)))
-            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.RedirectIdpFastPass);
+            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback);
 
         _challengeHandler
             .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
@@ -341,9 +194,8 @@ public class OktaIdxAuthenticatorTests
         var exception = await Should.ThrowAsync<OktaFastPassException>(() =>
             _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));
 
-        exception.Message.ShouldContain("redirect-idp");
-        exception.Message.ShouldContain("Okta Verify challenge");
-        _oktaHandler.RequestsTo(HttpMethod.Get, RedirectIdpUrl).Count().ShouldBe(1);
+        exception.Message.ShouldContain("Okta Verify");
+        _oktaHandler.RequestsTo(HttpMethod.Get, RedirectIdpUrl).ShouldBeEmpty();
     }
 
     [Fact]

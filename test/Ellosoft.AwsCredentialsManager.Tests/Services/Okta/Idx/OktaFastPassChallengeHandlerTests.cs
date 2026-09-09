@@ -42,6 +42,7 @@ public class OktaFastPassChallengeHandlerTests
         // Mac: cancelling loopback yields launch-authenticator. Windows: it yields redirect-idp (a
         // browser GET), so the CLI should probe Okta Verify's localhost server first.
         _handler.PreferAppLaunch.ShouldBe(!OperatingSystem.IsWindows());
+        _handler.LaunchAppAlongsideLoopback.ShouldBe(OperatingSystem.IsWindows());
     }
 
     [Fact]
@@ -85,6 +86,50 @@ public class OktaFastPassChallengeHandlerTests
         _oktaHandler.RequestsTo(HttpMethod.Post, CancelUrl).ShouldHaveSingleItem();
         _loopbackHandler.RequestsTo(HttpMethod.Post, "http://localhost:8769/challenge").ShouldHaveSingleItem();
         _appLauncher.DidNotReceiveWithAnyArgs().TryLaunch(default!);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Loopback_WhenLaunchAppAlongsideLoopback_ShouldOpenOktaVerifyWithTheChallengeJwtWhileProbing()
+    {
+        // Windows: open the app immediately (same JWT the widget uses) so Verify comes to the
+        // foreground. Do not wait for loopback to fail and then GET redirect-idp (that expires the session).
+        _handler.PreferAppLaunch = false;
+        _handler.LaunchAppAlongsideLoopback = true;
+        _appLauncher.TryLaunch(Arg.Any<string>()).Returns(true);
+
+        _loopbackHandler
+            .OnStatus(HttpMethod.Get, "http://localhost:8769/probe", HttpStatusCode.OK)
+            .OnStatus(HttpMethod.Post, "http://localhost:8769/challenge", HttpStatusCode.OK);
+
+        _oktaHandler.OnJson(HttpMethod.Post, PollUrl, IdxPayloads.Success);
+
+        var result = await _handler.ExecuteAsync(_idxClient, new Uri(OktaDomain), IdxResponse.Parse(IdxPayloads.LoopbackChallenge()), CancellationToken.None);
+
+        result.IsSuccess.ShouldBeTrue();
+        _appLauncher.Received(1).TryLaunch("com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.challenge.jwt");
+        _loopbackHandler.RequestsTo(HttpMethod.Post, "http://localhost:8769/challenge").ShouldHaveSingleItem();
+        _oktaHandler.RequestsTo(HttpMethod.Post, CancelUrl).ShouldBeEmpty();
+        _console.Output.ShouldContain("Please approve");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Loopback_WhenPollReturnsRedirectIdp_ShouldLaunchAppAndKeepPolling()
+    {
+        _handler.PreferAppLaunch = false;
+        _appLauncher.TryLaunch(Arg.Any<string>()).Returns(true);
+
+        _loopbackHandler
+            .OnStatus(HttpMethod.Get, "http://localhost:8769/probe", HttpStatusCode.OK)
+            .OnStatus(HttpMethod.Post, "http://localhost:8769/challenge", HttpStatusCode.OK);
+
+        _oktaHandler.OnJson(HttpMethod.Post, PollUrl, IdxPayloads.RedirectIdpFastPass, IdxPayloads.Success);
+
+        var result = await _handler.ExecuteAsync(_idxClient, new Uri(OktaDomain), IdxResponse.Parse(IdxPayloads.LoopbackChallenge()), CancellationToken.None);
+
+        result.IsSuccess.ShouldBeTrue();
+        _appLauncher.Received().TryLaunch("com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.challenge.jwt");
+        _oktaHandler.RequestsTo(HttpMethod.Post, CancelUrl).ShouldBeEmpty();
+        _oktaHandler.RequestsTo(HttpMethod.Post, PollUrl).Count().ShouldBe(2);
     }
 
     [Fact]

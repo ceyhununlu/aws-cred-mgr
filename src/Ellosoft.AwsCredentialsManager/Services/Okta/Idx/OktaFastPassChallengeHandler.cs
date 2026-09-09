@@ -51,10 +51,16 @@ public class OktaFastPassChallengeHandler(
 
     /// <summary>
     ///     When true, cancel the loopback probe immediately and ask Okta to open Okta Verify (Mac:
-    ///     <c>launch-authenticator</c>). On Windows that cancel returns <c>redirect-idp</c> (a browser GET with no
-    ///     Verify challenge), so the default is to probe localhost first, then open the app with the same JWT.
+    ///     <c>launch-authenticator</c>). On Windows that cancel returns <c>redirect-idp</c> (a browser GET that
+    ///     expires the IDX session), so the default is to probe localhost and open the app with the same JWT.
     /// </summary>
     public bool PreferAppLaunch { get; set; } = !OperatingSystem.IsWindows();
+
+    /// <summary>
+    ///     When true, open Okta Verify with the loopback challenge JWT at the same time as the localhost probe.
+    ///     Windows default: the CLI cannot follow <c>redirect-idp</c>, so the app must be opened directly.
+    /// </summary>
+    public bool LaunchAppAlongsideLoopback { get; set; } = OperatingSystem.IsWindows();
 
     public async Task<IdxResponse> ExecuteAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse challengeResponse, CancellationToken cancellationToken)
     {
@@ -102,6 +108,20 @@ public class OktaFastPassChallengeHandler(
         response is { IsSuccess: false, HasErrors: false, PollRemediation: not null, DeviceChallenge.IsLoopback: true }
         && response.GetRemediation(IdxResponse.LaunchAuthenticatorRemediation) is null;
 
+    /// <summary>
+    ///     Windows orgs switch the loopback poll to <c>redirect-idp</c>. That is a browser GET — following
+    ///     it expires the session. Open Verify with the JWT we already have and keep polling.
+    /// </summary>
+    private bool ShouldKeepPollingRedirectIdp(IdxResponse response, IdxDeviceChallenge challenge)
+    {
+        if (response.GetRemediation(IdxResponse.RedirectIdpRemediation) is null || response.PollRemediation is not null)
+            return false;
+
+        TryLaunchFromChallengeRequest(challenge);
+
+        return true;
+    }
+
     private async Task<IdxResponse> PollAsync(IdxClient idxClient, Uri oktaDomain, PollingContext context, CancellationToken cancellationToken)
     {
         var loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, cancellationToken);
@@ -127,6 +147,9 @@ public class OktaFastPassChallengeHandler(
 
             var response = await idxClient.PostAsync(context.PollRemediation.Href, context.StateHandle, cancellationToken);
 
+            if (ShouldKeepPollingRedirectIdp(response, context.Challenge))
+                continue;
+
             if (response.IsSuccess || response.HasErrors || response.DeviceChallenge is null || response.PollRemediation is null)
                 return response;
 
@@ -150,6 +173,9 @@ public class OktaFastPassChallengeHandler(
         if (challenge.IsLoopback)
         {
             console.MarkupLine("Contacting Okta Verify on this device...");
+
+            if (LaunchAppAlongsideLoopback)
+                TryLaunchFromChallengeRequest(challenge);
 
             return RunLoopbackAsync(challenge, oktaDomain, cancellationToken);
         }

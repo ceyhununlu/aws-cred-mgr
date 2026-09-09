@@ -31,6 +31,22 @@ public class OktaVerifyAppLauncherTests
     }
 
     [Fact]
+    public void DidProtocolLaunch_WhenProcessIsNullOnWindows_ShouldCountAsSuccess()
+    {
+        // ShellExecute of a custom URI returns null when Okta Verify is already running in the tray
+        OktaVerifyAppLauncher.DidProtocolLaunch(process: null, windows: true).ShouldBeTrue();
+        OktaVerifyAppLauncher.DidProtocolLaunch(process: null, windows: false).ShouldBeFalse();
+    }
+
+    [Fact]
+    public void TryParseExecutableFromCommand_ShouldReadQuotedOktaVerifyPath()
+    {
+        OktaVerifyAppLauncher.TryParseExecutableFromCommand(
+                @"""C:\Program Files\Okta\Okta Verify\Okta Verify.exe"" --URI ""%1""")
+            .ShouldBe(@"C:\Program Files\Okta\Okta Verify\Okta Verify.exe");
+    }
+
+    [Fact]
     public void ExtractOktaVerifyDeepLink_WhenHtmlContainsCustomUri_ShouldReturnDeepLink()
     {
         const string Html = """<html><a href="com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.jwt">Open Okta Verify</a></html>""";

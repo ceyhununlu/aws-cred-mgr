@@ -112,11 +112,9 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
     }
 
     [Fact]
-    public void OktaSetup_WithFastPass_WhenOktaReturnsRedirectIdp_ShouldFollowSameOriginRedirectAndCreateProfile()
+    public void OktaSetup_WithFastPass_WhenLaunchAppAlongsideLoopback_ShouldOpenOktaVerifyAndCreateProfile()
     {
-        // Windows FastPass: cancelling loopback yields redirect-idp instead of launch-authenticator
-        OktaIdxController.SetOffersRedirectIdp(TestCorrelationId, true);
-
+        // Windows path: open Verify with the loopback JWT (do not GET /sso/idps — that expires the session)
         var appLauncher = Substitute.For<IOktaVerifyAppLauncher>();
         appLauncher.TryLaunch(Arg.Any<string>()).Returns(_ =>
         {
@@ -125,20 +123,30 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
         });
 
         AppServices.Replace(ServiceDescriptor.Singleton(appLauncher));
+        AppServices.Replace(ServiceDescriptor.Singleton<IOktaFastPassChallengeHandler>(sp =>
+            new OktaFastPassChallengeHandler(
+                sp.GetRequiredService<IOktaIdxHttpClientFactory>(),
+                appLauncher,
+                App.Console,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger<OktaFastPassChallengeHandler>.Instance)
+            {
+                PreferAppLaunch = false,
+                LaunchAppAlongsideLoopback = true
+            }));
 
         var (domain, _, _) = RunOktaSetupWithFastPass();
 
         var requests = TestRequestsFilter.Requests[TestCorrelationId];
         var paths = requests.Select(r => r.Request.RequestUri!.AbsolutePath).ToList();
 
-        paths.ShouldContain("/idp/idx/authenticators/poll/cancel");
-        paths.ShouldContain("/sso/idps/0oa-fastpass");
+        paths.ShouldContain("/probe");
+        paths.ShouldContain("/challenge");
         paths.ShouldContain("/idp/idx/authenticators/poll");
-        paths.ShouldNotContain("/idp/idx/authenticators/okta-verify/launch");
-        paths.ShouldNotContain("/api/v1/authn");
+        paths.ShouldNotContain("/sso/idps/0oa-fastpass");
+        paths.ShouldNotContain("/idp/idx/authenticators/poll/cancel");
         paths.TakeLast(2).ShouldBe(["/login/token/redirect", "/api/v1/sessions/me"]);
 
-        appLauncher.Received(1).TryLaunch($"com-okta-authenticator:/deviceChallenge?challengeRequest={OktaIdxController.ChallengeRequest}");
+        appLauncher.Received().TryLaunch($"com-okta-authenticator:/deviceChallenge?challengeRequest={OktaIdxController.ChallengeRequest}");
 
         AssertProfileCreated(domain);
     }

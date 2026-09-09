@@ -45,6 +45,8 @@ public class OktaIdxAuthenticator(
 
     public async Task<AuthenticationResult> AuthenticateAsync(Uri oktaDomain, string username, string password, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(appLauncher);
+
         console.MarkupLine("Authenticating...");
 
         // the cookies Okta sets during the sign-in (sid, idx, device token...) are the resulting session, keep them for later requests
@@ -114,7 +116,7 @@ public class OktaIdxAuthenticator(
         // Windows FastPass: after the loopback probe is cancelled Okta returns redirect-idp (same-origin GET)
         // instead of launch-authenticator. Mac still uses launch-authenticator, which is handled above.
         if (response.GetRemediation(IdxResponse.RedirectIdpRemediation) is { } redirectIdp)
-            return await FollowRedirectIdpAsync(idxClient, oktaDomain, redirectIdp, stateHandle, cancellationToken);
+            return FollowRedirectIdp(oktaDomain, redirectIdp);
 
         if (response.GetRemediation(IdxResponse.SelectAuthenticatorRemediation) is { } selectAuthenticator)
             return await SelectAuthenticatorAsync(idxClient, response, selectAuthenticator, stateHandle, transaction, cancellationToken);
@@ -129,14 +131,13 @@ public class OktaIdxAuthenticator(
     }
 
     /// <summary>
-    ///     Follows a same-origin FastPass <c>redirect-idp</c> GET (Windows). <c>/sso/idps/{id}</c> is a browser
-    ///     navigation: Okta typically returns Sign-In Widget HTML (state token, embedded IDX, or a challenge JWT),
-    ///     not a raw <c>com-okta-authenticator:</c> link.
+    ///     Same-origin FastPass <c>redirect-idp</c> is a browser navigation (<c>/sso/idps/{id}</c>).
+    ///     GETting it from this CLI expires the IDX session. The challenge handler opens Okta Verify
+    ///     with the loopback JWT instead; reaching this method means that did not happen.
     /// </summary>
-    private async Task<IdxResponse> FollowRedirectIdpAsync(IdxClient idxClient, Uri oktaDomain, IdxRemediation redirectIdp,
-        string stateHandle, CancellationToken cancellationToken)
+    private IdxResponse FollowRedirectIdp(Uri oktaDomain, IdxRemediation redirectIdp)
     {
-        if (!TryGetSameOriginHttpsHref(oktaDomain, redirectIdp.Href, out var href))
+        if (!TryGetSameOriginHttpsHref(oktaDomain, redirectIdp.Href, out _))
         {
             throw new OktaFastPassException(
                 "Okta requested a sign-in step that is not supported by this tool: redirect-idp " +
@@ -144,101 +145,10 @@ public class OktaIdxAuthenticator(
                 "FastPass must stay on your Okta domain. Please enroll this device in Okta Verify or use a different MFA type (push, totp)");
         }
 
-        console.MarkupLine("Opening Okta Verify on this device...");
-
-        var raw = await idxClient.GetRawAsync(href, cancellationToken);
-
-        logger.LogDebug("FastPass redirect-idp GET {Href} returned HTTP {StatusCode} ({MediaType})",
-            href, raw.StatusCode, raw.MediaType ?? "unknown");
-
-        var embedded = OktaFastPassRedirectParser.TryGetEmbeddedIdx(raw.Content);
-
-        if (embedded is not null && IsRedirectProgress(embedded, href))
-            return embedded;
-
-        var deepLink = OktaFastPassRedirectParser.TryGetDeepLink(raw.Location, raw.Content);
-
-        if (deepLink is not null)
-        {
-            console.MarkupLine("Opening Okta Verify... Please approve the sign-in request in the app");
-
-            if (!appLauncher.TryLaunch(deepLink))
-            {
-                throw new OktaFastPassException(
-                    "Unable to open Okta Verify. Please make sure Okta Verify is installed on this device and try again");
-            }
-
-            return await IntrospectAsync(idxClient, oktaDomain, stateHandle: stateHandle, stateToken: null, cancellationToken);
-        }
-
-        var htmlStateToken = OktaLoginPageStateTokenExtractor.Extract(raw.Content);
-
-        if (!string.IsNullOrWhiteSpace(htmlStateToken))
-        {
-            var fromToken = await IntrospectAsync(idxClient, oktaDomain, stateHandle: null, stateToken: htmlStateToken, cancellationToken);
-
-            if (IsRedirectProgress(fromToken, href))
-                return fromToken;
-        }
-
-        // the GET may have advanced the transaction (cookies); continue from the current state handle
-        var fromHandle = await IntrospectAsync(idxClient, oktaDomain, stateHandle, stateToken: null, cancellationToken);
-
-        if (IsRedirectProgress(fromHandle, href))
-            return fromHandle;
+        logger.LogError("Okta returned FastPass redirect-idp {Href}; refusing to GET it (that expires the session)", redirectIdp.Href);
 
         throw new OktaFastPassException(
-            "Okta requested a sign-in step that is not supported by this tool: redirect-idp. " +
-            "The FastPass redirect did not return an Okta Verify challenge. Please try again");
-    }
-
-    private static Task<IdxResponse> IntrospectAsync(IdxClient idxClient, Uri oktaDomain, string? stateHandle, string? stateToken,
-        CancellationToken cancellationToken)
-    {
-        var body = new JsonObject();
-
-        if (stateToken is not null)
-            body["stateToken"] = stateToken;
-        else
-            body["stateHandle"] = stateHandle;
-
-        return idxClient.PostAsync(new Uri(oktaDomain, "/idp/idx/introspect").ToString(), body, cancellationToken);
-    }
-
-    /// <summary>
-    ///     True when the response moved the FastPass transaction past the same <c>redirect-idp</c> GET.
-    ///     Returning the same href would loop.
-    /// </summary>
-    private static bool IsRedirectProgress(IdxResponse response, string currentRedirectHref)
-    {
-        if (response.IsSuccess || response.HasErrors || response.PollRemediation is not null)
-            return true;
-
-        if (response.GetRemediation(IdxResponse.LaunchAuthenticatorRemediation) is not null
-            || response.GetRemediation(IdxResponse.IdentifyRemediation) is not null
-            || response.GetRemediation(IdxResponse.SelectAuthenticatorRemediation) is not null
-            || response.GetRemediation(IdxResponse.ChallengeAuthenticatorRemediation) is not null)
-        {
-            return true;
-        }
-
-        if (response.GetRemediation(IdxResponse.RedirectIdpRemediation) is { } nextRedirect
-            && !SameRedirectHref(nextRedirect.Href, currentRedirectHref))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    private static bool SameRedirectHref(string left, string right)
-    {
-        if (string.Equals(left, right, StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        return Uri.TryCreate(left, UriKind.Absolute, out var leftUri)
-               && Uri.TryCreate(right, UriKind.Absolute, out var rightUri)
-               && string.Equals(leftUri.GetLeftPart(UriPartial.Path), rightUri.GetLeftPart(UriPartial.Path), StringComparison.OrdinalIgnoreCase);
+            "Unable to open Okta Verify on this device. Please make sure Okta Verify is installed and running, then try again");
     }
 
     private static bool TryGetSameOriginHttpsHref(Uri oktaDomain, string href, out string sameOriginHref)
