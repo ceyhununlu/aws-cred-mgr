@@ -57,10 +57,10 @@ public class OktaFastPassChallengeHandler(
     public bool PreferAppLaunch { get; set; } = !OperatingSystem.IsWindows();
 
     /// <summary>
-    ///     When true, open Okta Verify with the loopback challenge JWT at the same time as the localhost probe.
-    ///     Windows default: the CLI cannot follow <c>redirect-idp</c>, so the app must be opened directly.
+    ///     When true, open Okta Verify with the loopback JWT at the same time as the localhost probe.
+    ///     Off by default: sending the same JWT twice makes Okta Verify's /verify call return 400.
     /// </summary>
-    public bool LaunchAppAlongsideLoopback { get; set; } = OperatingSystem.IsWindows();
+    public bool LaunchAppAlongsideLoopback { get; set; }
 
     public async Task<IdxResponse> ExecuteAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse challengeResponse, CancellationToken cancellationToken)
     {
@@ -110,17 +110,10 @@ public class OktaFastPassChallengeHandler(
 
     /// <summary>
     ///     Windows orgs switch the loopback poll to <c>redirect-idp</c>. That is a browser GET — following
-    ///     it expires the session. Open Verify with the JWT we already have and keep polling.
+    ///     it expires the session. Keep polling; do not send the same JWT again (that is a 400).
     /// </summary>
-    private bool ShouldKeepPollingRedirectIdp(IdxResponse response, IdxDeviceChallenge challenge)
-    {
-        if (response.GetRemediation(IdxResponse.RedirectIdpRemediation) is null || response.PollRemediation is not null)
-            return false;
-
-        TryLaunchFromChallengeRequest(challenge);
-
-        return true;
-    }
+    private static bool ShouldKeepPollingRedirectIdp(IdxResponse response) =>
+        response.GetRemediation(IdxResponse.RedirectIdpRemediation) is not null && response.PollRemediation is null;
 
     private async Task<IdxResponse> PollAsync(IdxClient idxClient, Uri oktaDomain, PollingContext context, CancellationToken cancellationToken)
     {
@@ -147,7 +140,7 @@ public class OktaFastPassChallengeHandler(
 
             var response = await idxClient.PostAsync(context.PollRemediation.Href, context.StateHandle, cancellationToken);
 
-            if (ShouldKeepPollingRedirectIdp(response, context.Challenge))
+            if (ShouldKeepPollingRedirectIdp(response))
                 continue;
 
             if (response.IsSuccess || response.HasErrors || response.DeviceChallenge is null || response.PollRemediation is null)
@@ -222,7 +215,7 @@ public class OktaFastPassChallengeHandler(
         if (string.IsNullOrWhiteSpace(challenge.ChallengeRequest))
             return false;
 
-        var deepLink = OktaFastPassRedirectParser.OktaVerifyDeviceChallengePrefix + challenge.ChallengeRequest;
+        var deepLink = OktaFastPassRedirectParser.BuildDeviceChallengeDeepLink(challenge.ChallengeRequest);
 
         console.MarkupLine("Opening Okta Verify... Please approve the sign-in request in the app");
 

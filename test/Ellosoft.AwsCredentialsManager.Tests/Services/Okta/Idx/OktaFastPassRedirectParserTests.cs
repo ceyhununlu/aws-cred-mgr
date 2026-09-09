@@ -26,6 +26,13 @@ public class OktaFastPassRedirectParserTests
     }
 
     [Fact]
+    public void BuildDeviceChallengeDeepLink_ShouldUrlEncodeTheJwt()
+    {
+        OktaFastPassRedirectParser.BuildDeviceChallengeDeepLink("eyJ+abc=/")
+            .ShouldBe("com-okta-authenticator:/deviceChallenge?challengeRequest=eyJ%2Babc%3D%2F");
+    }
+
+    [Fact]
     public void TryGetEmbeddedIdx_WhenHtmlWrapsIonJson_ShouldParseRemediation()
     {
         var html = $"<html><script>window.__oktaIdxResponse = {IdxPayloads.DeviceChallengePollCustomUri};</script></html>";

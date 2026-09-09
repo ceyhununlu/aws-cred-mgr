@@ -12,6 +12,9 @@ public static partial class OktaFastPassRedirectParser
 {
     public const string OktaVerifyDeviceChallengePrefix = "com-okta-authenticator:/deviceChallenge?challengeRequest=";
 
+    public static string BuildDeviceChallengeDeepLink(string challengeRequest) =>
+        OktaVerifyDeviceChallengePrefix + Uri.EscapeDataString(challengeRequest);
+
     public static string? TryGetDeepLink(string? location, string content)
     {
         return OktaVerifyAppLauncher.ExtractOktaVerifyDeepLink(location)
@@ -67,7 +70,7 @@ public static partial class OktaFastPassRedirectParser
 
         var jwt = match.Groups["jwt"].Value;
 
-        return jwt.Length > 0 ? OktaVerifyDeviceChallengePrefix + jwt : null;
+        return jwt.Length > 0 ? BuildDeviceChallengeDeepLink(jwt) : null;
     }
 
     private static IdxResponse? TryParseIdx(string json)
