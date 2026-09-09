@@ -50,11 +50,11 @@ public class OktaFastPassChallengeHandler(
     public TimeSpan Timeout { get; set; } = TimeSpan.FromMinutes(2);
 
     /// <summary>
-    ///     When Okta offers the loopback binding first, ask Okta to open Okta Verify (deep link) right away instead of
-    ///     probing the loopback ports: the app comes to the foreground with the approval prompt, and it also works when
-    ///     Okta Verify is not running. Loopback is still used when Okta does not offer to open the app.
+    ///     When true, cancel the loopback probe immediately and ask Okta to open Okta Verify (Mac:
+    ///     <c>launch-authenticator</c>). On Windows that cancel returns <c>redirect-idp</c> (a browser GET), so the
+    ///     default is to probe Okta Verify's localhost server first.
     /// </summary>
-    public bool PreferAppLaunch { get; set; } = true;
+    public bool PreferAppLaunch { get; set; } = !OperatingSystem.IsWindows();
 
     public async Task<IdxResponse> ExecuteAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse challengeResponse, CancellationToken cancellationToken)
     {

@@ -37,8 +37,19 @@ public class OktaFastPassChallengeHandlerTests
     }
 
     [Fact]
+    public void PreferAppLaunch_ShouldSkipLoopbackOnlyWhenOktaCanOpenTheAppDirectly()
+    {
+        // Mac: cancelling loopback yields launch-authenticator. Windows: it yields redirect-idp (a
+        // browser GET), so the CLI should probe Okta Verify's localhost server first.
+        _handler.PreferAppLaunch.ShouldBe(!OperatingSystem.IsWindows());
+    }
+
+    [Fact]
     public async Task ExecuteAsync_Loopback_ByDefault_ShouldAskOktaToOpenTheAppInsteadOfProbingLoopbackPorts()
     {
+        // Mac path: cancelling loopback yields launch-authenticator. Forced on so this stays valid on Windows CI.
+        _handler.PreferAppLaunch = true;
+
         // Okta answers the cancellation with the "launch-authenticator" remediation (Okta Verify deep link)
         _oktaHandler.OnJson(HttpMethod.Post, CancelUrl, IdxPayloads.IdentifyWithoutPassword);
 
@@ -58,6 +69,8 @@ public class OktaFastPassChallengeHandlerTests
     [Fact]
     public async Task ExecuteAsync_Loopback_ByDefault_WhenOktaDoesNotOfferToOpenTheApp_ShouldFallBackToLoopback()
     {
+        _handler.PreferAppLaunch = true;
+
         _loopbackHandler
             .OnStatus(HttpMethod.Get, "http://localhost:8769/probe", HttpStatusCode.OK)
             .OnStatus(HttpMethod.Post, "http://localhost:8769/challenge", HttpStatusCode.OK);

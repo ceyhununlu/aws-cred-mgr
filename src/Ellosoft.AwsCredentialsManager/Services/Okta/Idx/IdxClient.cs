@@ -47,8 +47,11 @@ public sealed class IdxClient(HttpClient httpClient) : IDisposable
     public async Task<IdxRawResponse> GetRawAsync(string href, CancellationToken cancellationToken = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, href);
-        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(ION_JSON_MEDIA_TYPE) { Parameters = { OktaVersionParameter() } });
+        // /sso/idps/{id} is a browser navigation; prefer HTML so Okta returns the Sign-In Widget (state token)
+        // instead of an Ion document that is not a FastPass challenge
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/html"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/xhtml+xml"));
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue(ION_JSON_MEDIA_TYPE) { Parameters = { OktaVersionParameter() } });
 
         using var response = await HttpClient.SendAsync(request, cancellationToken);
         var content = await response.Content.ReadAsStringAsync(cancellationToken);

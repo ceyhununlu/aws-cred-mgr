@@ -126,7 +126,15 @@ public class OktaIdxController : ControllerBase
     ///     Windows FastPass: Okta returns a same-origin redirect-idp GET instead of launch-authenticator
     /// </summary>
     [HttpGet("/sso/idps/0oa-fastpass")]
-    public IActionResult FastPassRedirectIdp() => Ion(DeviceChallengePollCustomUri());
+    public IActionResult FastPassRedirectIdp()
+    {
+        // real Windows orgs serve Sign-In Widget HTML from /sso/idps/{id}, not a raw Ion document
+        var idx = DeviceChallengePollCustomUri();
+
+        return Content(
+            $"<!DOCTYPE html><html><head><script>window.__oktaIdxResponse = {idx};</script></head><body>Opening Okta Verify</body></html>",
+            "text/html");
+    }
 
     /// <summary>
     ///     Simulates the user approving the sign-in in the Okta Verify app (CUSTOM_URI challenge)
