@@ -8,7 +8,7 @@ AWS Credential Manager (`aws-cred-mgr`) is a command-line interface (CLI) tool d
 
 ## Features
 
-- **Okta Authentication**: Easily setup Okta authentication for you user
+- **Okta Authentication**: Easily setup Okta authentication for you user (Okta Verify push, TOTP code or Okta FastPass on macOS and Windows)
 - **Credential Management**: Create and list AWS credentials, manage profiles with ease.
 - **RDS Token Management**: Obtain RDS passwords for your databases securely.
 
@@ -57,6 +57,7 @@ aws-cred-mgr okta setup
 
 - Simply run `aws-cred-mgr okta setup` to use interactive mode.
 - Set up with domain and username: `aws-cred-mgr okta setup -d https://xyz.okta.com -u john --mfa push`
+- Set up using Okta FastPass (Okta Verify desktop app, macOS and Windows): `aws-cred-mgr okta setup -d https://xyz.okta.com -u john --mfa fastpass`
 
 ### Credential Management
 

@@ -45,13 +45,17 @@ public sealed class OktaSetupTests(ITestOutputHelper outputHelper, TestFixture t
         TestRequestsFilter.Requests[TestCorrelationId][0]
             .Request.RequestUri.ShouldBe(new Uri($"{domain}/api/v1/authn"));
 
-        var userCredentialsService = TestFixture.WebApp.Services.GetRequiredService<IUserCredentialsManager>();
+        // the encrypted credentials store is only available on Windows and macOS
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+        {
+            var userCredentialsService = TestFixture.WebApp.Services.GetRequiredService<IUserCredentialsManager>();
 
-        var userCredentials = userCredentialsService.GetUserCredentials(_profileName);
+            var userCredentials = userCredentialsService.GetUserCredentials(_profileName);
 
-        userCredentials.ShouldNotBeNull();
-        userCredentials!.Username.ShouldBe(username);
-        userCredentials.Password.ShouldBe(password);
+            userCredentials.ShouldNotBeNull();
+            userCredentials.Username.ShouldBe(username);
+            userCredentials.Password.ShouldBe(password);
+        }
     }
 
     public void Dispose()
