@@ -132,9 +132,32 @@ public class OktaFastPassChallengeHandlerTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_Loopback_WhenNoPortIsListening_ShouldCancelPollingWithUnreachableReason()
+    public async Task ExecuteAsync_Loopback_WhenNoPortIsListening_ShouldLaunchOktaVerifyWithTheSameChallengeJwtAndKeepPolling()
+    {
+        // Sign-In Widget fallback: same JWT via com-okta-authenticator, keep polling. Do not cancel —
+        // on Windows cancel returns redirect-idp (a browser page), not a Verify challenge.
+        _handler.PreferAppLaunch = false;
+        _appLauncher.TryLaunch(Arg.Any<string>()).Returns(true);
+
+        _loopbackHandler
+            .OnUnreachable(HttpMethod.Get, "http://localhost:8769/probe")
+            .OnUnreachable(HttpMethod.Get, "http://localhost:65111/probe");
+
+        _oktaHandler.OnJson(HttpMethod.Post, PollUrl, IdxPayloads.LoopbackChallenge(), IdxPayloads.Success);
+
+        var result = await _handler.ExecuteAsync(_idxClient, new Uri(OktaDomain), IdxResponse.Parse(IdxPayloads.LoopbackChallenge()), CancellationToken.None);
+
+        result.IsSuccess.ShouldBeTrue();
+        _appLauncher.Received(1).TryLaunch("com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.challenge.jwt");
+        _oktaHandler.RequestsTo(HttpMethod.Post, CancelUrl).ShouldBeEmpty();
+        _console.Output.ShouldContain("open the app");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_Loopback_WhenNoPortIsListeningAndAppCannotBeLaunched_ShouldCancelPollingWithUnreachableReason()
     {
         _handler.PreferAppLaunch = false;
+        _appLauncher.TryLaunch(Arg.Any<string>()).Returns(false);
 
         _loopbackHandler
             .OnUnreachable(HttpMethod.Get, "http://localhost:8769/probe")
@@ -159,21 +182,21 @@ public class OktaFastPassChallengeHandlerTests
     [InlineData("http://evil.example.com")]
     [InlineData("https://localhost")]
     [InlineData("not a url")]
-    public async Task ExecuteAsync_Loopback_WhenChallengeDomainIsNotHttpLoopback_ShouldNotContactItAndCancelPolling(string domain)
+    public async Task ExecuteAsync_Loopback_WhenChallengeDomainIsNotHttpLoopback_ShouldNotContactItAndOpenTheAppInstead(string domain)
     {
         _handler.PreferAppLaunch = false;
+        _appLauncher.TryLaunch(Arg.Any<string>()).Returns(true);
 
         var payload = IdxPayloads.LoopbackChallenge().Replace("\"domain\": \"http://localhost\"", $"\"domain\": \"{domain}\"");
 
-        _oktaHandler
-            .OnJson(HttpMethod.Post, PollUrl, payload)
-            .OnJson(HttpMethod.Post, CancelUrl, IdxPayloads.IdentifyWithoutPassword);
+        _oktaHandler.OnJson(HttpMethod.Post, PollUrl, payload, IdxPayloads.Success);
 
         var result = await _handler.ExecuteAsync(_idxClient, new Uri(OktaDomain), IdxResponse.Parse(payload), CancellationToken.None);
 
-        result.HasRemediation("launch-authenticator").ShouldBeTrue();
+        result.IsSuccess.ShouldBeTrue();
         _loopbackHandler.Requests.ShouldBeEmpty();
-        JsonNode.Parse(_oktaHandler.RequestsTo(HttpMethod.Post, CancelUrl).ShouldHaveSingleItem().Body!)!["reason"]!.GetValue<string>().ShouldBe("OV_UNREACHABLE_BY_LOOPBACK");
+        _appLauncher.Received(1).TryLaunch("com-okta-authenticator:/deviceChallenge?challengeRequest=eyJraWQ.challenge.jwt");
+        _oktaHandler.RequestsTo(HttpMethod.Post, CancelUrl).ShouldBeEmpty();
     }
 
     [Fact]

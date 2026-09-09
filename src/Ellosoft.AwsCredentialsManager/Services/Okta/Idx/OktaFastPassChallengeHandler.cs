@@ -51,8 +51,8 @@ public class OktaFastPassChallengeHandler(
 
     /// <summary>
     ///     When true, cancel the loopback probe immediately and ask Okta to open Okta Verify (Mac:
-    ///     <c>launch-authenticator</c>). On Windows that cancel returns <c>redirect-idp</c> (a browser GET), so the
-    ///     default is to probe Okta Verify's localhost server first.
+    ///     <c>launch-authenticator</c>). On Windows that cancel returns <c>redirect-idp</c> (a browser GET with no
+    ///     Verify challenge), so the default is to probe localhost first, then open the app with the same JWT.
     /// </summary>
     public bool PreferAppLaunch { get; set; } = !OperatingSystem.IsWindows();
 
@@ -173,6 +173,11 @@ public class OktaFastPassChallengeHandler(
             case LoopbackOutcomeKind.Unreachable:
                 console.MarkupLine("[yellow]Okta Verify could not be reached on this device, trying to open the app instead...[/]");
 
+                // Sign-In Widget fallback: same challenge JWT via com-okta-authenticator, keep polling.
+                // Do not cancel — on Windows cancel returns redirect-idp (a browser page with no Verify challenge).
+                if (TryLaunchFromChallengeRequest(context.Challenge))
+                    return null;
+
                 return await CancelPollingAsync(idxClient, context, REASON_UNREACHABLE, null, cancellationToken);
 
             case LoopbackOutcomeKind.Error:
@@ -181,6 +186,26 @@ public class OktaFastPassChallengeHandler(
             default:
                 return null;
         }
+    }
+
+    /// <summary>
+    ///     Opens Okta Verify with the LOOPBACK challenge JWT (same token the widget puts on the custom URI).
+    /// </summary>
+    private bool TryLaunchFromChallengeRequest(IdxDeviceChallenge challenge)
+    {
+        if (string.IsNullOrWhiteSpace(challenge.ChallengeRequest))
+            return false;
+
+        var deepLink = OktaFastPassRedirectParser.OktaVerifyDeviceChallengePrefix + challenge.ChallengeRequest;
+
+        console.MarkupLine("Opening Okta Verify... Please approve the sign-in request in the app");
+
+        if (appLauncher.TryLaunch(deepLink))
+            return true;
+
+        logger.LogWarning("Unable to open Okta Verify using the loopback challenge JWT");
+
+        return false;
     }
 
     /// <summary>
