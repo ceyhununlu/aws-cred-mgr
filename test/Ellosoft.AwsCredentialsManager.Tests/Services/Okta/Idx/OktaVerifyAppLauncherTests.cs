@@ -29,4 +29,36 @@ public class OktaVerifyAppLauncherTests
     {
         OktaVerifyAppLauncher.IsOktaVerifyDeepLink(uri).ShouldBeTrue();
     }
+
+    [Theory]
+    [InlineData(@"""C:\Program Files\Okta\Okta Verify\OktaVerify.exe"" --URI ""%1""", @"C:\Program Files\Okta\Okta Verify\OktaVerify.exe")]
+    [InlineData(@"""C:\Program Files\Okta\Okta Verify\OktaVerify.exe""", @"C:\Program Files\Okta\Okta Verify\OktaVerify.exe")]
+    [InlineData(@"C:\Okta\OktaVerify.exe ""%1""", @"C:\Okta\OktaVerify.exe")]
+    [InlineData(@"C:\Okta\oktaverify.EXE", @"C:\Okta\oktaverify.EXE")]
+    public void ExtractExecutablePath_ShouldReadTheOktaVerifyExecutableFromTheUriHandlerCommand(string command, string expected)
+    {
+        OktaVerifyAppLauncher.ExtractExecutablePath(command).ShouldBe(expected);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(@"""C:\Program Files\Okta\Okta Verify\OktaVerify.exe")]
+    [InlineData(@"""C:\Windows\System32\cmd.exe"" /c evil ""%1""")]
+    [InlineData(@"C:\Tools\SomethingElse.exe ""%1""")]
+    public void ExtractExecutablePath_WhenTheCommandIsNotOktaVerify_ShouldReturnNull(string? command)
+    {
+        // the registry value is not trusted blindly: only Okta Verify's own executable is ever started
+        OktaVerifyAppLauncher.ExtractExecutablePath(command).ShouldBeNull();
+    }
+
+    [Fact]
+    public void TryStartApp_OnUnsupportedPlatform_ShouldReturnFalse()
+    {
+        if (OperatingSystem.IsWindows() || OperatingSystem.IsMacOS())
+            return;
+
+        _launcher.TryStartApp().ShouldBeFalse();
+    }
 }
