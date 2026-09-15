@@ -356,6 +356,32 @@ public static class IdxPayloads
         }
         """;
 
+    /// <summary>
+    ///     What an org with an identity provider routing rule answers when the FastPass challenge is cancelled:
+    ///     nothing but a browser redirect to the external IdP (the Sign-In Widget would navigate there automatically)
+    /// </summary>
+    public const string RedirectIdpOnly =
+        """
+        {
+          "version": "1.0.0",
+          "stateHandle": "02state-handle",
+          "intent": "LOGIN",
+          "remediation": {
+            "type": "array",
+            "value": [
+              {
+                "name": "redirect-idp",
+                "type": "MICROSOFT",
+                "idp": { "id": "0oa1idpazure", "name": "Contoso Entra ID" },
+                "href": "https://xyz.okta.com/sso/idps/0oa1idpazure?stateToken=02state-handle",
+                "method": "GET"
+              }
+            ]
+          },
+          "cancel": { "rel": ["create-form"], "name": "cancel", "href": "https://xyz.okta.com/idp/idx/cancel", "method": "POST" }
+        }
+        """;
+
     public const string Success =
         """
         {

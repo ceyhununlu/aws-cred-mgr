@@ -36,6 +36,24 @@ public sealed record IdxDeviceChallenge(
 public sealed record IdxAuthenticatorOption(string Key, string Id, IReadOnlyList<string> MethodTypes, string? EnrollmentId);
 
 /// <summary>
+///     "redirect-idp" remediation: Okta hands the sign-in over to an identity provider through a browser navigation
+///     (social login, SAML/OIDC enterprise IdP, PIV/X509...). Typically produced by an identity provider routing rule.
+/// </summary>
+/// <param name="Type">IdP type (GOOGLE, MICROSOFT, SAML2, OIDC, X509...)</param>
+/// <param name="IdpName">Display name of the identity provider configured in Okta</param>
+/// <param name="Href">Browser URL of the redirect (/sso/idps/{id}...)</param>
+public sealed record IdxIdpRedirect(string? Type, string? IdpName, string Href)
+{
+    public string Description => (Type, IdpName) switch
+    {
+        (null, null) => "an external identity provider",
+        (_, null) => $"an external identity provider ({Type})",
+        (null, _) => $"the external identity provider '{IdpName}'",
+        _ => $"the external identity provider '{IdpName}' ({Type})"
+    };
+}
+
+/// <summary>
 ///     Read-only view over an Okta Identity Engine (IDX) Ion JSON response
 /// </summary>
 public sealed class IdxResponse
@@ -46,6 +64,7 @@ public sealed class IdxResponse
     public const string ChallengePollRemediation = "challenge-poll";
     public const string DeviceChallengePollRemediation = "device-challenge-poll";
     public const string LaunchAuthenticatorRemediation = "launch-authenticator";
+    public const string RedirectIdpRemediation = "redirect-idp";
 
     private const string ValueProperty = "value";
 
@@ -59,6 +78,7 @@ public sealed class IdxResponse
         RemediationNames = Remediations.Select(r => r.Name).ToList();
         ErrorMessages = ReadErrorMessages();
         AuthenticatorOptionLabels = GetAuthenticatorOptions().Select(o => o["label"]?.GetValue<string>() ?? string.Empty).ToList();
+        IdpRedirects = ReadIdpRedirects();
     }
 
     public static IdxResponse Parse(string json)
@@ -88,6 +108,17 @@ public sealed class IdxResponse
     public bool HasErrors => ErrorMessages.Count > 0;
 
     public IReadOnlyList<IdxMessage> ErrorMessages { get; }
+
+    /// <summary>
+    ///     "redirect-idp" remediations offered by Okta (identity provider routing rules, IdP authenticators)
+    /// </summary>
+    public IReadOnlyList<IdxIdpRedirect> IdpRedirects { get; }
+
+    /// <summary>
+    ///     True when Okta left no other option than following an identity provider redirect in a browser.
+    ///     In the Sign-In Widget this response triggers an automatic navigation to the IdP; a CLI cannot complete it.
+    /// </summary>
+    public bool IsIdpRedirectOnly => !IsSuccess && !HasErrors && Remediations.Count > 0 && Remediations.All(r => r.Name == RedirectIdpRemediation);
 
     public bool IdentifyRequiresPassword =>
         GetRemediation(IdentifyRemediation)?.Fields?.OfType<JsonObject>().Any(f => f["name"]?.GetValue<string>() == "credentials") == true;
@@ -212,6 +243,16 @@ public sealed class IdxResponse
         .OfType<JsonObject>()
         .Where(m => m["class"]?.GetValue<string>() is "ERROR")
         .Select(m => new IdxMessage(m["message"]?.GetValue<string>() ?? string.Empty, m["i18n"]?["key"]?.GetValue<string>()))
+        .ToList();
+
+    private IReadOnlyList<IdxIdpRedirect> ReadIdpRedirects() =>
+        (_root["remediation"]?[ValueProperty] as JsonArray ?? [])
+        .OfType<JsonObject>()
+        .Where(r => r["name"]?.GetValue<string>() == RedirectIdpRemediation)
+        .Select(r => new IdxIdpRedirect(
+            Type: r["type"]?.GetValue<string>(),
+            IdpName: r["idp"]?["name"]?.GetValue<string>(),
+            Href: r["href"]?.GetValue<string>() ?? string.Empty))
         .ToList();
 
     private IReadOnlyList<IdxRemediation> ReadRemediations() =>

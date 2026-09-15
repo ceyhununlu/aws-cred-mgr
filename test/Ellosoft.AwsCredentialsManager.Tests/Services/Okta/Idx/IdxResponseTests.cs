@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Ellosoft Limited. All rights reserved.
 
+using System.Text.Json.Nodes;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 
 namespace Ellosoft.AwsCredentialsManager.Tests.Services.Okta.Idx;
@@ -156,5 +157,45 @@ public class IdxResponseTests
 
         response.GetAuthenticatorOption("webauthn").ShouldBeNull();
         response.AuthenticatorOptionLabels.ShouldBe(["Okta Verify", "Password"]);
+    }
+
+    [Fact]
+    public void IdpRedirects_ShouldExposeIdpTypeNameAndHref()
+    {
+        var response = IdxResponse.Parse(IdxPayloads.RedirectIdpOnly);
+
+        var redirect = response.IdpRedirects.ShouldHaveSingleItem();
+        redirect.Type.ShouldBe("MICROSOFT");
+        redirect.IdpName.ShouldBe("Contoso Entra ID");
+        redirect.Href.ShouldBe("https://xyz.okta.com/sso/idps/0oa1idpazure?stateToken=02state-handle");
+        redirect.Description.ShouldBe("the external identity provider 'Contoso Entra ID' (MICROSOFT)");
+
+        response.IsIdpRedirectOnly.ShouldBeTrue();
+        response.PollRemediation.ShouldBeNull();
+    }
+
+    [Fact]
+    public void IsIdpRedirectOnly_WhenOktaOffersAnotherStep_ShouldBeFalse()
+    {
+        var withIdentify = JsonNode.Parse(IdxPayloads.RedirectIdpOnly)!;
+        withIdentify["remediation"]!["value"]!.AsArray().Add(JsonNode.Parse(
+            """{ "rel": ["create-form"], "name": "identify", "href": "https://xyz.okta.com/idp/idx/identify", "method": "POST", "value": [] }"""));
+
+        var response = IdxResponse.Parse(withIdentify.ToJsonString());
+
+        response.IdpRedirects.ShouldHaveSingleItem();
+        response.IsIdpRedirectOnly.ShouldBeFalse();
+
+        IdxResponse.Parse(IdxPayloads.IdentifyWithPassword).IdpRedirects.ShouldBeEmpty();
+        IdxResponse.Parse(IdxPayloads.IdentifyWithPassword).IsIdpRedirectOnly.ShouldBeFalse();
+        IdxResponse.Parse(IdxPayloads.Success).IsIdpRedirectOnly.ShouldBeFalse();
+    }
+
+    [Fact]
+    public void IdpRedirectDescription_WhenTypeOrNameIsMissing_ShouldStillDescribeTheRedirect()
+    {
+        new IdxIdpRedirect(null, null, "https://xyz.okta.com/sso/idps/x").Description.ShouldBe("an external identity provider");
+        new IdxIdpRedirect("SAML2", null, "https://xyz.okta.com/sso/idps/x").Description.ShouldBe("an external identity provider (SAML2)");
+        new IdxIdpRedirect(null, "Corp SSO", "https://xyz.okta.com/sso/idps/x").Description.ShouldBe("the external identity provider 'Corp SSO'");
     }
 }
