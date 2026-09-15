@@ -129,42 +129,53 @@ public class OktaFastPassChallengeHandler(
     {
         using var recovery = new LoopbackRecovery();
 
-        var loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, cancellationToken);
+        // Okta may move the transaction on (success, error, IdP redirect) while a loopback request is still in flight:
+        // that request is cancelled when polling ends so Okta Verify does not keep a stale prompt open
+        using var loopbackCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-        console.MarkupLine("Waiting for Okta Verify...");
-
-        while (true)
+        try
         {
-            if (loopbackTask is { IsCompleted: true })
+            var loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, loopbackCts.Token);
+
+            console.MarkupLine("Waiting for Okta Verify...");
+
+            while (true)
             {
-                var outcome = await loopbackTask;
+                if (loopbackTask is { IsCompleted: true })
+                {
+                    var outcome = await loopbackTask;
 
-                var nextStep = await HandleLoopbackOutcomeAsync(idxClient, oktaDomain, context, outcome, recovery, cancellationToken);
+                    var nextStep = await HandleLoopbackOutcomeAsync(idxClient, oktaDomain, context, outcome, recovery, loopbackCts.Token);
 
-                if (nextStep.CancelResponse is not null)
-                    return nextStep.CancelResponse;
+                    if (nextStep.CancelResponse is not null)
+                        return nextStep.CancelResponse;
 
-                loopbackTask = nextStep.RetryTask;
+                    loopbackTask = nextStep.RetryTask;
+                }
+                else
+                {
+                    await Task.Delay(GetPollInterval(context.PollRemediation), cancellationToken);
+                }
+
+                var response = await idxClient.PostAsync(context.PollRemediation.Href, context.StateHandle, cancellationToken);
+
+                if (response.IsSuccess || response.HasErrors || response.DeviceChallenge is null || response.PollRemediation is null)
+                    return response;
+
+                var previousChallenge = context.Challenge;
+                context = context.Update(response);
+
+                // Okta issued a new challenge (e.g. user verification step-up), deliver it as well
+                if (!IsSameChallenge(previousChallenge, context.Challenge))
+                {
+                    recovery.CancelPendingRetry();
+                    loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, loopbackCts.Token);
+                }
             }
-            else
-            {
-                await Task.Delay(GetPollInterval(context.PollRemediation), cancellationToken);
-            }
-
-            var response = await idxClient.PostAsync(context.PollRemediation.Href, context.StateHandle, cancellationToken);
-
-            if (response.IsSuccess || response.HasErrors || response.DeviceChallenge is null || response.PollRemediation is null)
-                return response;
-
-            var previousChallenge = context.Challenge;
-            context = context.Update(response);
-
-            // Okta issued a new challenge (e.g. user verification step-up), deliver it as well
-            if (!IsSameChallenge(previousChallenge, context.Challenge))
-            {
-                recovery.CancelPendingRetry();
-                loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, cancellationToken);
-            }
+        }
+        finally
+        {
+            await loopbackCts.CancelAsync();
         }
     }
 

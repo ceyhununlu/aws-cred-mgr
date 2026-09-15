@@ -59,6 +59,12 @@ public sealed class FakeHttpMessageHandler : HttpMessageHandler
     public static HttpResponseMessage Html(string html, HttpStatusCode statusCode = HttpStatusCode.OK) =>
         new(statusCode) { Content = new StringContent(html, Encoding.UTF8, "text/html") };
 
+    public static HttpResponseMessage Redirect(string location, HttpStatusCode statusCode = HttpStatusCode.Found) =>
+        new(statusCode) { Headers = { Location = new Uri(location, UriKind.RelativeOrAbsolute) }, Content = new StringContent(string.Empty) };
+
+    public FakeHttpMessageHandler OnRedirect(HttpMethod method, string url, string location) =>
+        On(method, url, _ => Task.FromResult(Redirect(location)));
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);

@@ -213,6 +213,35 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
         _configManager.DidNotReceive().SaveConfig();
     }
 
+    [Fact]
+    public void OktaSetup_WithFastPass_OnWindows_WhenOktaRoutesToDesktopSso_ShouldCompleteKerberosSignInAndCreateProfile()
+    {
+        // domain-joined Windows device: the identity provider routing rule hands the sign-in to Agentless Desktop SSO
+        OktaIdxController.SetRoutesToDesktopSso(TestCorrelationId, true);
+
+        var appLauncher = Substitute.For<IOktaVerifyAppLauncher>();
+        UseWindowsChallengeStrategy(appLauncher);
+
+        var (domain, _, _) = RunOktaSetupWithFastPass();
+
+        var requests = TestRequestsFilter.Requests[TestCorrelationId];
+        var paths = requests.Select(r => r.Request.RequestUri!.AbsolutePath).ToList();
+
+        paths.ShouldContain("/idp/idx/authenticators/poll");
+        paths.ShouldContain("/sso/idps/0oa1dsso");
+        paths.ShouldContain("/login/agentlessDsso");
+        paths.ShouldContain("/login/agentlessDsso/redirect");
+        paths.ShouldContain("/enduser/callback");
+        paths.ShouldNotContain("/idp/idx/authenticators/poll/cancel");
+        paths.ShouldNotContain("/login/token/redirect");
+        paths[^1].ShouldBe("/api/v1/sessions/me");
+
+        var kerberosRequest = requests.Single(r => r.Request.RequestUri!.AbsolutePath == "/login/agentlessDsso");
+        kerberosRequest.Request.RequestUri!.Host.ShouldBe(new Uri(domain).Host.Replace(".okta.com", ".kerberos.okta.com"));
+
+        AssertProfileCreated(domain);
+    }
+
     /// <summary>
     ///     Configures the challenge handler the way it is configured on Windows (independently of the OS running the tests)
     /// </summary>
@@ -270,6 +299,8 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
         public HttpClient CreateSessionClient(CookieContainer cookieContainer) => Create();
 
         public HttpClient CreateLoopbackClient() => Create();
+
+        public HttpClient CreateDesktopSsoClient(CookieContainer cookieContainer, ICredentials credentials) => Create();
 
         private HttpClient Create() => new(new CorrelationIdMessageHandler(correlationId) { InnerHandler = server.CreateHandler() });
     }

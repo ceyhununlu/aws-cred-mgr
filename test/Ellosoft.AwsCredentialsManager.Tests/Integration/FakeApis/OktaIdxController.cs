@@ -24,6 +24,7 @@ public class OktaIdxController : ControllerBase
     private static readonly ConcurrentDictionary<string, bool> AppLaunchOffered = new();
     private static readonly ConcurrentDictionary<string, bool> RoutesToIdpOnCancel = new();
     private static readonly ConcurrentDictionary<string, bool> LoopbackListening = new();
+    private static readonly ConcurrentDictionary<string, bool> RoutesToDesktopSso = new();
 
     /// <summary>
     ///     Identity Engine orgs serve the End-User Dashboard SPA shell on the org root (no state token)
@@ -81,6 +82,10 @@ public class OktaIdxController : ControllerBase
     [HttpPost("/idp/idx/authenticators/poll")]
     public IActionResult Poll([FromBody] JsonElement request)
     {
+        // Agentless Desktop SSO org: once Okta Verify has identified the device the routing rule takes over the sign-in
+        if (RoutesToDesktopSso.TryGetValue(CorrelationId, out var routesToDsso) && routesToDsso)
+            return Ion(RedirectAgentlessDsso());
+
         if (ChallengeDelivered.TryGetValue(CorrelationId, out var delivered) && delivered)
         {
             return Ion(
@@ -147,11 +152,50 @@ public class OktaIdxController : ControllerBase
 
     private static bool IsLoopbackListening(string correlationId) => !LoopbackListening.TryGetValue(correlationId, out var listening) || listening;
 
+    /// <summary>
+    ///     Makes the fake org behave like an org with Agentless Desktop SSO for this client: the FastPass poll ends in a
+    ///     "redirect-idp" of type AgentlessDSSO leading to the Kerberos endpoint (default: false)
+    /// </summary>
+    public static void SetRoutesToDesktopSso(string correlationId, bool routesToDsso) => RoutesToDesktopSso[correlationId] = routesToDsso;
+
     [HttpGet("/login/token/redirect")]
     public IActionResult SuccessRedirect() => Content("<html><body>Okta Dashboard</body></html>", "text/html");
 
     [HttpGet("/sso/idps/{idpId}")]
-    public IActionResult IdpRedirect(string idpId) => Content($"<html><body>Redirecting to {idpId}...</body></html>", "text/html");
+    public IActionResult IdpRedirect(string idpId, [FromQuery] string stateToken)
+    {
+        if (idpId == DesktopSsoIdpId)
+            return Redirect($"{Request.Scheme}://{KerberosHost}/login/agentlessDsso?stateToken={stateToken}");
+
+        return Content($"<html><body>Redirecting to {idpId}...</body></html>", "text/html");
+    }
+
+    // ---- fake Agentless Desktop SSO (Kerberos) endpoint: a browser gets a 401 Negotiate here and answers with its ticket ----
+
+    [HttpGet("/login/agentlessDsso")]
+    public IActionResult AgentlessDsso([FromQuery] string stateToken)
+    {
+        if (!Request.Host.Host.Contains(".kerberos.", StringComparison.OrdinalIgnoreCase))
+            return BadRequest("Agentless DSSO is only served on the org Kerberos host");
+
+        var orgHost = Request.Host.Host.Replace(".kerberos.", ".", StringComparison.OrdinalIgnoreCase);
+
+        return Redirect($"{Request.Scheme}://{orgHost}/login/agentlessDsso/redirect?token=kerberos-ok&stateToken={stateToken}");
+    }
+
+    [HttpGet("/login/agentlessDsso/redirect")]
+    public IActionResult AgentlessDssoCallback([FromQuery] string token)
+    {
+        if (token != "kerberos-ok")
+            return Redirect($"{BaseUrl}/login/default");
+
+        Response.Cookies.Append("sid", SessionId);
+
+        return Redirect($"{BaseUrl}/enduser/callback?code=dsso-code&state=123");
+    }
+
+    [HttpGet("/enduser/callback")]
+    public IActionResult DashboardCallback() => DashboardShell();
 
     // ---- fake Okta Verify loopback server ----
 
@@ -175,6 +219,43 @@ public class OktaIdxController : ControllerBase
     private string CorrelationId => Request.Headers["Correlation-Id"].ToString();
 
     private string BaseUrl => $"{Request.Scheme}://{Request.Host}";
+
+    /// <summary>
+    ///     xyz.okta.com -> xyz.kerberos.okta.com (the host Okta uses for Agentless DSSO)
+    /// </summary>
+    private string KerberosHost
+    {
+        get
+        {
+            var host = Request.Host.Host;
+            var firstDot = host.IndexOf('.');
+
+            return firstDot < 0 ? $"{host}.kerberos" : $"{host[..firstDot]}.kerberos{host[firstDot..]}";
+        }
+    }
+
+    private const string DesktopSsoIdpId = "0oa1dsso";
+
+    private string RedirectAgentlessDsso() =>
+        $$"""
+          {
+            "version": "1.0.0",
+            "stateHandle": "{{StateHandle}}",
+            "intent": "LOGIN",
+            "remediation": {
+              "type": "array",
+              "value": [
+                {
+                  "name": "redirect-idp",
+                  "type": "AgentlessDSSO",
+                  "idp": { "id": "{{DesktopSsoIdpId}}", "name": "AgentlessDSSO" },
+                  "href": "{{BaseUrl}}/sso/idps/{{DesktopSsoIdpId}}?stateToken={{StateToken}}",
+                  "method": "GET"
+                }
+              ]
+            }
+          }
+          """;
 
     private ContentResult Ion(string json) => Content(json, ION_JSON);
 

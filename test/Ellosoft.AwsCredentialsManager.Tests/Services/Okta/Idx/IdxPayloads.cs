@@ -382,6 +382,32 @@ public static class IdxPayloads
         }
         """;
 
+    /// <summary>
+    ///     Org with Agentless Desktop SSO: the identity provider routing rule sends (domain-joined Windows) devices to
+    ///     Okta's Kerberos endpoint, what a browser completes silently with the OS user's Kerberos ticket
+    /// </summary>
+    public const string RedirectAgentlessDsso =
+        """
+        {
+          "version": "1.0.0",
+          "stateHandle": "02state-handle",
+          "intent": "LOGIN",
+          "remediation": {
+            "type": "array",
+            "value": [
+              {
+                "name": "redirect-idp",
+                "type": "AgentlessDSSO",
+                "idp": { "id": "0oa1dsso", "name": "AgentlessDSSO" },
+                "href": "https://xyz.okta.com/sso/idps/0oa1dsso?stateToken=02state-handle",
+                "method": "GET"
+              }
+            ]
+          },
+          "cancel": { "rel": ["create-form"], "name": "cancel", "href": "https://xyz.okta.com/idp/idx/cancel", "method": "POST" }
+        }
+        """;
+
     public const string Success =
         """
         {

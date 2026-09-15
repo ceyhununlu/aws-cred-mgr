@@ -44,6 +44,7 @@ public static class ServiceRegistration
             .AddSingleton<IOktaIdxHttpClientFactory, OktaIdxHttpClientFactory>()
             .AddSingleton<IOktaVerifyAppLauncher, OktaVerifyAppLauncher>()
             .AddSingleton<IOktaFastPassChallengeHandler, OktaFastPassChallengeHandler>()
+            .AddSingleton<IOktaAgentlessDssoHandler, OktaAgentlessDssoHandler>()
             .AddSingleton<IOktaIdxAuthenticator, OktaIdxAuthenticator>();
 
         // aws related services

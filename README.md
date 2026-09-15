@@ -97,6 +97,12 @@ Requirements and troubleshooting:
   redirected the sign-in to an external identity provider (`redirect-idp`), your org has an identity provider
   routing rule for Windows devices that takes over as soon as the FastPass challenge is abandoned; the tool never
   abandons it while Okta Verify can be reached, so make sure Okta Verify is up (or use `push`/`totp`).
+- **Windows + Agentless Desktop SSO**: orgs that route domain-joined Windows devices to Okta's *Agentless Desktop
+  Single Sign-on* (IdP type `AgentlessDSSO`) are handled like a browser does it: the tool follows the redirect to
+  `https://<org>.kerberos.okta.com/login/agentlessDsso` and answers the Kerberos challenge with your Windows
+  account (no prompt). This needs a domain-joined device that can reach a domain controller (corporate network or
+  VPN); `klist` should show a ticket for `HTTP/<org>.kerberos.okta.com` after a sign-in. If Okta then still asks
+  for MFA, the FastPass flow continues from the page Okta returns.
 - The login times out after 2 minutes waiting for approval; simply rerun the command.
 - Run any command with the hidden `--log-level debug` option to write detailed diagnostics (including the Okta
   responses) to `~/.aws_cred_mgr/aws-cred-mgr.log` when reporting issues.

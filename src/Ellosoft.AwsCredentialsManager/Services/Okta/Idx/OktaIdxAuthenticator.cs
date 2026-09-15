@@ -29,6 +29,7 @@ public interface IOktaIdxAuthenticator
 public class OktaIdxAuthenticator(
     IOktaIdxHttpClientFactory httpClientFactory,
     IOktaFastPassChallengeHandler challengeHandler,
+    IOktaAgentlessDssoHandler desktopSsoHandler,
     IAnsiConsole console,
     ILogger<OktaIdxAuthenticator> logger) : IOktaIdxAuthenticator
 {
@@ -61,7 +62,7 @@ public class OktaIdxAuthenticator(
         {
             if (response.IsSuccess)
             {
-                var sessionId = await CompleteLoginAsync(idxClient, oktaDomain, response, cancellationToken);
+                var sessionId = transaction.SessionId ?? await CompleteLoginAsync(idxClient, oktaDomain, response, cancellationToken);
 
                 console.MarkupLine("\r\n[bold green]Authenticated![/]\r\n");
 
@@ -78,15 +79,19 @@ public class OktaIdxAuthenticator(
             if (response.HasErrors)
                 return HandleErrors(oktaDomain, response);
 
-            response = await ExecuteNextRemediationAsync(idxClient, oktaDomain, response, transaction, cancellationToken);
+            response = await ExecuteNextRemediationAsync(idxClient, oktaDomain, response, transaction, sessionCookies, cancellationToken);
         }
 
         throw new OktaFastPassException("Okta sign-in did not complete after too many steps. Please try again");
     }
 
     private async Task<IdxResponse> ExecuteNextRemediationAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse response, Transaction transaction,
-        CancellationToken cancellationToken)
+        CookieContainer sessionCookies, CancellationToken cancellationToken)
     {
+        // Desktop SSO (Kerberos) needs no state handle: Okta hands the whole transaction over to its Kerberos endpoint
+        if (!transaction.DesktopSsoAttempted && response.IdpRedirects.FirstOrDefault(OktaAgentlessDssoHandler.IsAgentlessDsso) is { } desktopSso)
+            return await CompleteDesktopSsoAsync(idxClient, oktaDomain, desktopSso, transaction, sessionCookies, cancellationToken);
+
         var stateHandle = response.StateHandle ?? throw new OktaFastPassException("Okta response does not contain a state handle");
 
         if (response.PollRemediation is not null)
@@ -137,6 +142,13 @@ public class OktaIdxAuthenticator(
         logger.LogError("Okta redirected the sign-in to {Idps} (redirect-idp), FastPass cannot continue outside a browser. Remediations: {Remediations}",
             idps, string.Join(", ", response.RemediationNames));
 
+        if (transaction.DesktopSsoAttempted && response.IdpRedirects.Any(OktaAgentlessDssoHandler.IsAgentlessDsso))
+        {
+            return new OktaFastPassException(
+                $"Okta routed the sign-in to Desktop Single Sign-on ({idps}) again after the Kerberos sign-in did not produce an Okta session. " +
+                DesktopSsoTroubleshooting);
+        }
+
         var stage = transaction.Identified
             ? "after the Okta Verify (FastPass) challenge could not be completed on this device"
             : "before the user could be identified";
@@ -147,6 +159,61 @@ public class OktaIdxAuthenticator(
             "Make sure Okta Verify is installed, enrolled with Okta FastPass and running on this device, then try again; " +
             "or configure a different MFA type (push, totp). Run with '--log-level debug' and check the log file for the Okta responses");
     }
+
+    private const string DesktopSsoTroubleshooting =
+        "Desktop SSO needs a domain-joined device that can reach a domain controller (corporate network or VPN) and a Kerberos ticket " +
+        "for the Okta Kerberos endpoint (run 'klist' and look for HTTP/<org>.kerberos.okta.com; 'klist purge' then retry refreshes it). " +
+        "Alternatively ask your Okta admin to exclude this device from the Desktop SSO identity provider routing rule, " +
+        "or configure a different MFA type (push, totp). Run with '--log-level debug' and check the log file for the redirect chain";
+
+    /// <summary>
+    ///     Orgs with Agentless Desktop SSO route Windows (domain-joined) devices to their Kerberos endpoint instead of the
+    ///     Okta Verify challenge. A browser completes this silently; so does the CLI (SSPI). Okta then either creates the
+    ///     session straight away (dashboard callback) or hands back a sign-in page with a new state token (e.g. MFA still
+    ///     required, or Kerberos failed and Okta fell back to /login/default) from which the IDX flow continues
+    /// </summary>
+    private async Task<IdxResponse> CompleteDesktopSsoAsync(IdxClient idxClient, Uri oktaDomain, IdxIdpRedirect redirect, Transaction transaction,
+        CookieContainer sessionCookies, CancellationToken cancellationToken)
+    {
+        transaction.DesktopSsoAttempted = true;
+
+        var result = await desktopSsoHandler.ExecuteAsync(oktaDomain, redirect, sessionCookies, cancellationToken);
+
+        if (await GetSessionIdAsync(idxClient, oktaDomain, cancellationToken) is { } sessionId)
+        {
+            logger.LogDebug("Desktop SSO established the Okta session (final URL: {FinalUrl})", result.FinalUrl);
+
+            transaction.SessionId = sessionId;
+
+            return IdxResponse.Parse(SessionEstablishedResponse);
+        }
+
+        if (OktaLoginPageStateTokenExtractor.Extract(result.Content) is { } stateToken)
+        {
+            logger.LogDebug("Desktop SSO ended on a sign-in page with a new state token (final URL: {FinalUrl}, HTTP {StatusCode}), resuming the sign-in",
+                result.FinalUrl, (int)result.StatusCode);
+
+            if (result.KerberosRejected)
+                console.MarkupLine("[yellow]Desktop Single Sign-on (Kerberos) was not accepted, continuing with the Okta sign-in...[/]");
+
+            return await idxClient.PostAsync(new Uri(oktaDomain, "/idp/idx/introspect").ToString(), new JsonObject { ["stateToken"] = stateToken }, cancellationToken);
+        }
+
+        logger.LogError("Desktop SSO did not establish an Okta session: final URL {FinalUrl}, HTTP {StatusCode}, Kerberos host: {KerberosHost}",
+            result.FinalUrl, (int)result.StatusCode, result.KerberosHost ?? "none");
+
+        var kerberosOutcome = result.KerberosRejected
+            ? $"{result.KerberosHost ?? result.FinalUrl.Host} rejected the Kerberos sign-in (HTTP 401)"
+            : $"the sign-in ended at {result.FinalUrl.GetLeftPart(UriPartial.Path)} (HTTP {(int)result.StatusCode}) without an Okta session";
+
+        throw new OktaFastPassException($"Okta routed the sign-in to Desktop Single Sign-on ({redirect.Description}) but {kerberosOutcome}. " + DesktopSsoTroubleshooting);
+    }
+
+    /// <summary>
+    ///     IDX success response without a redirect: the Okta session already exists (set by the Desktop SSO callback)
+    /// </summary>
+    private const string SessionEstablishedResponse =
+        """{ "version": "1.0.0", "success": { "rel": ["create-form"], "name": "success-redirect", "method": "GET" } }""";
 
     private static Task<IdxResponse> IdentifyAsync(IdxClient idxClient, IdxResponse response, IdxRemediation identify, string stateHandle,
         Transaction transaction, CancellationToken cancellationToken)
@@ -292,20 +359,33 @@ public class OktaIdxAuthenticator(
     /// <summary>
     ///     Follows the IDX success redirect (this sets the Okta session cookie) and resolves the session id
     /// </summary>
-    private static async Task<string> CompleteLoginAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse response, CancellationToken cancellationToken)
+    private async Task<string> CompleteLoginAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse response, CancellationToken cancellationToken)
     {
         if (response.SuccessHref is { } successHref)
         {
             using var redirectResponse = await idxClient.HttpClient.GetAsync(successHref, cancellationToken);
         }
 
+        return await GetSessionIdAsync(idxClient, oktaDomain, cancellationToken)
+               ?? throw new OktaFastPassException("Okta sign-in succeeded but the Okta session could not be retrieved");
+    }
+
+    /// <summary>
+    ///     Resolves the id of the Okta session carried by the transaction cookies (null when there is no session yet)
+    /// </summary>
+    private async Task<string?> GetSessionIdAsync(IdxClient idxClient, Uri oktaDomain, CancellationToken cancellationToken)
+    {
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(oktaDomain, "/api/v1/sessions/me"));
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
 
         using var sessionResponse = await idxClient.HttpClient.SendAsync(request, cancellationToken);
 
         if (!sessionResponse.IsSuccessStatusCode)
-            throw new OktaFastPassException($"Okta sign-in succeeded but the Okta session could not be retrieved ({(int)sessionResponse.StatusCode})");
+        {
+            logger.LogDebug("No Okta session yet (GET /api/v1/sessions/me -> {StatusCode})", (int)sessionResponse.StatusCode);
+
+            return null;
+        }
 
         var session = JsonNode.Parse(await sessionResponse.Content.ReadAsStringAsync(cancellationToken));
 
@@ -321,5 +401,12 @@ public class OktaIdxAuthenticator(
         public bool Identified { get; set; }
 
         public bool PasswordProvided { get; set; }
+
+        public bool DesktopSsoAttempted { get; set; }
+
+        /// <summary>
+        ///     Session created outside the IDX success step (Desktop SSO callback)
+        /// </summary>
+        public string? SessionId { get; set; }
     }
 }

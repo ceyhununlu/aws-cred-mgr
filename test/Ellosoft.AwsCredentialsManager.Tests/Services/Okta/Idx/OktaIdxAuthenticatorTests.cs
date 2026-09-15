@@ -29,6 +29,7 @@ public class OktaIdxAuthenticatorTests
 
     private readonly FakeHttpMessageHandler _oktaHandler = new();
     private readonly IOktaFastPassChallengeHandler _challengeHandler = Substitute.For<IOktaFastPassChallengeHandler>();
+    private readonly IOktaAgentlessDssoHandler _desktopSsoHandler = Substitute.For<IOktaAgentlessDssoHandler>();
     private readonly TestConsole _console = new();
     private readonly OktaIdxAuthenticator _authenticator;
 
@@ -46,7 +47,7 @@ public class OktaIdxAuthenticatorTests
             .On(HttpMethod.Get, SuccessRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html>Okta Dashboard</html>")))
             .OnJson(HttpMethod.Get, SessionsMeUrl, SessionsMe);
 
-        _authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+        _authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
     }
 
     [Fact]
@@ -96,7 +97,7 @@ public class OktaIdxAuthenticatorTests
             .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
             .Returns(IdxResponse.Parse(IdxPayloads.Success));
 
-        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
 
         var result = await authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
 
@@ -258,6 +259,127 @@ public class OktaIdxAuthenticatorTests
     }
 
     [Fact]
+    public async Task AuthenticateAsync_WhenOktaRoutesToDesktopSso_ShouldCompleteKerberosSignInAndReturnTheSession()
+    {
+        // Windows domain-joined device: Okta probes Okta Verify before identify, then the routing rule sends the sign-in to Desktop SSO
+        _oktaHandler.OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.ChallengePollLoopback);
+
+        _challengeHandler
+            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
+            .Returns(IdxResponse.Parse(IdxPayloads.RedirectAgentlessDsso));
+
+        _desktopSsoHandler
+            .ExecuteAsync(new Uri(OktaDomain), Arg.Is<IdxIdpRedirect>(r => r.Type == "AgentlessDSSO"), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/enduser/callback?code=1"), HttpStatusCode.OK, DashboardShell, "xyz.kerberos.okta.com"));
+
+        var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
+
+        result.Authenticated.ShouldBeTrue();
+        result.SessionId.ShouldBe("102sid");
+        result.SessionCookies.ShouldBeSameAs(_sessionCookies);
+
+        await _desktopSsoHandler.Received(1).ExecuteAsync(new Uri(OktaDomain), Arg.Any<IdxIdpRedirect>(), _sessionCookies!, Arg.Any<CancellationToken>());
+
+        // the session came from the Kerberos callback: no IDX success redirect to follow, no identify ever posted
+        _oktaHandler.RequestsTo(HttpMethod.Get, SuccessRedirectUrl).ShouldBeEmpty();
+        _oktaHandler.RequestsTo(HttpMethod.Post, IdentifyUrl).ShouldBeEmpty();
+        _oktaHandler.RequestsTo(HttpMethod.Get, SessionsMeUrl).ShouldHaveSingleItem();
+        _console.Output.ShouldContain("Authenticated!");
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_WhenDesktopSsoEndsOnASignInPage_ShouldResumeTheSignInFromItsStateToken()
+    {
+        // Kerberos was not accepted (or MFA is still required): Okta falls back to a sign-in page carrying a new state token
+        const string fallbackLoginPage = """<html><script>var stateToken = '02fallback\x2Dtoken';</script></html>""";
+
+        var handler = new FakeHttpMessageHandler()
+            .OnPrefix(HttpMethod.Get, SignInPageUrlPrefix, _ => Task.FromResult(FakeHttpMessageHandler.Html(LoginPage)))
+            .On(HttpMethod.Post, IntrospectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Json(IdxPayloads.RedirectAgentlessDsso)), _ => Task.FromResult(FakeHttpMessageHandler.Json(IdxPayloads.IdentifyWithPassword)))
+            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback)
+            .On(HttpMethod.Get, SuccessRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html/>")))
+            .On(HttpMethod.Get, SessionsMeUrl, _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)), _ => Task.FromResult(FakeHttpMessageHandler.Json(SessionsMe)));
+
+        var httpClientFactory = Substitute.For<IOktaIdxHttpClientFactory>();
+        httpClientFactory.CreateSessionClient(Arg.Any<CookieContainer>()).Returns(_ => new HttpClient(handler));
+
+        _desktopSsoHandler
+            .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/default"), HttpStatusCode.OK, fallbackLoginPage, "xyz.kerberos.okta.com"));
+
+        _challengeHandler
+            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
+            .Returns(IdxResponse.Parse(IdxPayloads.Success));
+
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+
+        var result = await authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
+
+        result.Authenticated.ShouldBeTrue();
+        result.SessionId.ShouldBe("102sid");
+
+        var introspects = handler.RequestsTo(HttpMethod.Post, IntrospectUrl).Select(Body).ToList();
+        introspects.Count.ShouldBe(2);
+        introspects[0]["stateToken"]!.GetValue<string>().ShouldBe("02state-token");
+        introspects[1]["stateToken"]!.GetValue<string>().ShouldBe("02fallback-token");
+
+        Body(handler.RequestsTo(HttpMethod.Post, IdentifyUrl).ShouldHaveSingleItem())["identifier"]!.GetValue<string>().ShouldBe("john@xyz.com");
+        await _desktopSsoHandler.Received(1).ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_WhenDesktopSsoIsRoutedToAgain_ShouldThrowInsteadOfLooping()
+    {
+        const string fallbackLoginPage = """<html><script>var stateToken = '02fallback\x2Dtoken';</script></html>""";
+
+        var handler = new FakeHttpMessageHandler()
+            .OnPrefix(HttpMethod.Get, SignInPageUrlPrefix, _ => Task.FromResult(FakeHttpMessageHandler.Html(LoginPage)))
+            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.RedirectAgentlessDsso)
+            .OnStatus(HttpMethod.Get, SessionsMeUrl, HttpStatusCode.NotFound);
+
+        var httpClientFactory = Substitute.For<IOktaIdxHttpClientFactory>();
+        httpClientFactory.CreateSessionClient(Arg.Any<CookieContainer>()).Returns(_ => new HttpClient(handler));
+
+        _desktopSsoHandler
+            .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/default"), HttpStatusCode.OK, fallbackLoginPage, "xyz.kerberos.okta.com"));
+
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+
+        var exception = await Should.ThrowAsync<OktaFastPassException>(() =>
+            authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));
+
+        exception.Message.ShouldContain("Desktop Single Sign-on");
+        exception.Message.ShouldContain("klist");
+        await _desktopSsoHandler.Received(1).ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_WhenKerberosIsRejectedAndNoSignInPageComesBack_ShouldThrowExplainingKerberos()
+    {
+        var handler = new FakeHttpMessageHandler()
+            .OnPrefix(HttpMethod.Get, SignInPageUrlPrefix, _ => Task.FromResult(FakeHttpMessageHandler.Html(LoginPage)))
+            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.RedirectAgentlessDsso)
+            .OnStatus(HttpMethod.Get, SessionsMeUrl, HttpStatusCode.NotFound);
+
+        var httpClientFactory = Substitute.For<IOktaIdxHttpClientFactory>();
+        httpClientFactory.CreateSessionClient(Arg.Any<CookieContainer>()).Returns(_ => new HttpClient(handler));
+
+        _desktopSsoHandler
+            .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.kerberos.okta.com/login/agentlessDsso"), HttpStatusCode.Unauthorized, string.Empty, "xyz.kerberos.okta.com"));
+
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+
+        var exception = await Should.ThrowAsync<OktaFastPassException>(() =>
+            authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));
+
+        exception.Message.ShouldContain("xyz.kerberos.okta.com rejected the Kerberos sign-in (HTTP 401)");
+        exception.Message.ShouldContain("domain-joined");
+        exception.Message.ShouldNotContain("needs a browser");
+    }
+
+    [Fact]
     public async Task AuthenticateAsync_WhenFastPassIsNotOffered_ShouldThrowListingOfferedAuthenticators()
     {
         var withoutFastPass = IdxPayloads.SelectAuthenticator.Replace("""{ "value": "signed_nonce", "label": "Use Okta FastPass" },""", string.Empty);
@@ -316,7 +438,7 @@ public class OktaIdxAuthenticatorTests
         var httpClientFactory = Substitute.For<IOktaIdxHttpClientFactory>();
         httpClientFactory.CreateSessionClient(Arg.Any<CookieContainer>()).Returns(_ => new HttpClient(handler));
 
-        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
 
         var exception = await Should.ThrowAsync<OktaFastPassException>(() =>
             authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));
@@ -341,7 +463,7 @@ public class OktaIdxAuthenticatorTests
             .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
             .Returns(IdxResponse.Parse(IdxPayloads.Success));
 
-        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
 
         await Should.ThrowAsync<OktaFastPassException>(() =>
             authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));

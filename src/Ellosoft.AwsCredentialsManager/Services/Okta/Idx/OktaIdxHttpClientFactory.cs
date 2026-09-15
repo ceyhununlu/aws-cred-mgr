@@ -17,6 +17,12 @@ public interface IOktaIdxHttpClientFactory
     ///     Creates an HTTP client to talk to the Okta Verify loopback server on localhost
     /// </summary>
     HttpClient CreateLoopbackClient();
+
+    /// <summary>
+    ///     Creates an HTTP client for Okta Agentless Desktop SSO: shares the sign-in cookie jar, answers "Negotiate"
+    ///     challenges with the given credentials (Kerberos ticket of the OS user) and leaves redirects to the caller
+    /// </summary>
+    HttpClient CreateDesktopSsoClient(CookieContainer cookieContainer, ICredentials credentials);
 }
 
 public class OktaIdxHttpClientFactory : IOktaIdxHttpClientFactory
@@ -30,6 +36,25 @@ public class OktaIdxHttpClientFactory : IOktaIdxHttpClientFactory
             AllowAutoRedirect = true
         };
 
+        return CreateBrowserLikeClient(handler);
+    }
+
+    public HttpClient CreateDesktopSsoClient(CookieContainer cookieContainer, ICredentials credentials)
+    {
+        var handler = new HttpClientHandler
+        {
+            UseCookies = true,
+            CookieContainer = cookieContainer,
+            AllowAutoRedirect = false,
+            Credentials = credentials,
+            PreAuthenticate = false
+        };
+
+        return CreateBrowserLikeClient(handler);
+    }
+
+    private static HttpClient CreateBrowserLikeClient(HttpMessageHandler handler)
+    {
         var httpClient = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(60) };
         httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(OktaHttpClient.GetPlatformUserAgent());
 
