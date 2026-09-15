@@ -6,6 +6,7 @@ using Ellosoft.AwsCredentialsManager.Commands.Okta;
 using Ellosoft.AwsCredentialsManager.Infrastructure.Cli;
 using Ellosoft.AwsCredentialsManager.Services.Configuration;
 using Ellosoft.AwsCredentialsManager.Services.Configuration.Models;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Exceptions;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
 using Ellosoft.AwsCredentialsManager.Services.Security;
@@ -14,7 +15,9 @@ using Ellosoft.AwsCredentialsManager.Tests.Integration.Utils;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using NSubstitute;
+using Spectre.Console;
 
 namespace Ellosoft.AwsCredentialsManager.Tests.Integration.Commands.Okta;
 
@@ -109,6 +112,124 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
         challenge.Request.Headers.GetValues("Origin").ShouldBe([domain]);
 
         AssertProfileCreated(domain);
+    }
+
+    [Fact]
+    public void OktaSetup_WithFastPass_OnWindows_ShouldDeliverTheChallengeThroughLoopbackWithoutCancellingIt()
+    {
+        // Windows shaped org: cancelling the challenge would end in a browser redirect to an external IdP (routing rule)
+        OktaIdxController.SetRoutesToIdpOnCancel(TestCorrelationId, true);
+
+        var appLauncher = Substitute.For<IOktaVerifyAppLauncher>();
+        UseWindowsChallengeStrategy(appLauncher);
+
+        var (domain, _, _) = RunOktaSetupWithFastPass();
+
+        var requests = TestRequestsFilter.Requests[TestCorrelationId];
+        var paths = requests.Select(r => r.Request.RequestUri!.AbsolutePath).ToList();
+
+        paths.ShouldContain("/probe");
+        paths.ShouldContain("/challenge");
+        paths.ShouldContain("/idp/idx/authenticators/poll");
+        paths.ShouldNotContain("/idp/idx/authenticators/poll/cancel");
+        paths.ShouldNotContain("/idp/idx/authenticators/okta-verify/launch");
+        paths.ShouldNotContain(p => p.StartsWith("/sso/idps/"));
+        paths.TakeLast(2).ShouldBe(["/login/token/redirect", "/api/v1/sessions/me"]);
+
+        var challenge = requests.Single(r => r.Request.RequestUri!.AbsolutePath == "/challenge");
+        ((JsonElement)challenge.RequestModel!).GetProperty("challengeRequest").GetString().ShouldBe(OktaIdxController.ChallengeRequest);
+        challenge.Request.Headers.GetValues("Origin").ShouldBe([domain]);
+
+        appLauncher.DidNotReceiveWithAnyArgs().TryLaunch(default!);
+        appLauncher.DidNotReceive().TryStartApp();
+
+        AssertProfileCreated(domain);
+    }
+
+    [Fact]
+    public void OktaSetup_WithFastPass_OnWindows_WhenOktaVerifyIsNotRunning_ShouldStartItAndDeliverTheChallengeOnceItListens()
+    {
+        OktaIdxController.SetRoutesToIdpOnCancel(TestCorrelationId, true);
+        OktaIdxController.SetLoopbackListening(TestCorrelationId, false);
+
+        // starting Okta Verify brings its loopback server up
+        var appLauncher = Substitute.For<IOktaVerifyAppLauncher>();
+        appLauncher.TryStartApp().Returns(_ =>
+        {
+            OktaIdxController.SetLoopbackListening(TestCorrelationId, true);
+            return true;
+        });
+
+        UseWindowsChallengeStrategy(appLauncher);
+
+        var (domain, _, _) = RunOktaSetupWithFastPass();
+
+        var requests = TestRequestsFilter.Requests[TestCorrelationId];
+        var paths = requests.Select(r => r.Request.RequestUri!.AbsolutePath).ToList();
+
+        paths.Count(p => p == "/probe").ShouldBeGreaterThanOrEqualTo(2);
+        paths.ShouldContain("/challenge");
+        paths.ShouldNotContain("/idp/idx/authenticators/poll/cancel");
+        paths.ShouldNotContain(p => p.StartsWith("/sso/idps/"));
+        paths.TakeLast(2).ShouldBe(["/login/token/redirect", "/api/v1/sessions/me"]);
+
+        appLauncher.Received(1).TryStartApp();
+        appLauncher.DidNotReceiveWithAnyArgs().TryLaunch(default!);
+
+        AssertProfileCreated(domain);
+    }
+
+    [Fact]
+    public void OktaSetup_WithFastPass_OnWindows_WhenOktaVerifyIsNotInstalled_ShouldFailExplainingTheIdpRedirect()
+    {
+        OktaIdxController.SetRoutesToIdpOnCancel(TestCorrelationId, true);
+        OktaIdxController.SetLoopbackListening(TestCorrelationId, false);
+
+        var appLauncher = Substitute.For<IOktaVerifyAppLauncher>();
+        appLauncher.TryStartApp().Returns(false);
+
+        UseWindowsChallengeStrategy(appLauncher);
+
+        App.Configure(config =>
+            config.AddBranch<OktaBranch>(okta =>
+                okta.AddCommand<SetupOkta>()));
+
+        var domain = $"https://{Faker.Internet.DomainWord()}.okta.com";
+
+        App.Console.Input.PushTextWithEnter(Faker.Internet.Password());
+
+        var exception = Should.Throw<OktaFastPassException>(() => App.Run("okta", "setup", _profileName, "-d", domain, "-u", Faker.Internet.UserName(), "--mfa", "fastpass"));
+
+        exception.Message.ShouldContain("Okta Verify could not be reached on this device");
+        exception.Message.ShouldContain("Contoso Entra ID");
+        exception.Message.ShouldNotContain("not supported by this tool");
+
+        var paths = TestRequestsFilter.Requests[TestCorrelationId].Select(r => r.Request.RequestUri!.AbsolutePath).ToList();
+
+        paths.ShouldContain("/idp/idx/authenticators/poll/cancel");
+        paths.ShouldNotContain(p => p.StartsWith("/sso/idps/"));
+        paths.ShouldNotContain("/login/token/redirect");
+
+        _configManager.DidNotReceive().SaveConfig();
+    }
+
+    /// <summary>
+    ///     Configures the challenge handler the way it is configured on Windows (independently of the OS running the tests)
+    /// </summary>
+    private void UseWindowsChallengeStrategy(IOktaVerifyAppLauncher appLauncher)
+    {
+        AppServices.Replace(ServiceDescriptor.Singleton(appLauncher));
+        AppServices.Replace(ServiceDescriptor.Singleton<IOktaFastPassChallengeHandler>(sp =>
+            new OktaFastPassChallengeHandler(
+                sp.GetRequiredService<IOktaIdxHttpClientFactory>(),
+                appLauncher,
+                sp.GetRequiredService<IAnsiConsole>(),
+                sp.GetRequiredService<ILogger<OktaFastPassChallengeHandler>>())
+            {
+                PreferAppLaunch = false,
+                StartOktaVerifyWhenUnreachable = true,
+                AppStartupProbeInterval = TimeSpan.FromMilliseconds(100)
+            }));
     }
 
     private (string Domain, string Username, string Password) RunOktaSetupWithFastPass()

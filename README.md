@@ -77,19 +77,26 @@ with the device-bound key. This is the same phishing-resistant flow the Okta sig
 How it works:
 
 1. `aws-cred-mgr` starts an Okta Identity Engine sign-in with your username and password.
-2. Okta issues a FastPass device challenge and `aws-cred-mgr` asks Okta to open the **Okta Verify app** on this
-   device (a `com-okta-authenticator://` link, the same as the "Open Okta Verify" button on the Okta sign-in page).
-   Okta Verify comes to the foreground with the approval prompt; it does not need to be running beforehand.
-3. If Okta does not offer to open the app, the challenge is delivered to Okta Verify through its local loopback
-   server (`http://localhost:<port>`) instead, exactly like the Okta sign-in page does.
-4. Okta Verify asks you to approve (biometrics/PIN), `aws-cred-mgr` waits for Okta to confirm and then continues
-   with the AWS role selection / credential retrieval as usual.
+2. Okta issues a FastPass device challenge for the **Okta Verify app** on this device:
+   - **macOS**: `aws-cred-mgr` asks Okta to open Okta Verify (a `com-okta-authenticator://` link, the same as the
+     "Open Okta Verify" button on the Okta sign-in page). Okta Verify comes to the foreground with the approval
+     prompt; it does not need to be running beforehand. If Okta does not offer to open the app, the challenge is
+     delivered through the Okta Verify local loopback server (`http://localhost:<port>`) instead.
+   - **Windows**: the challenge is delivered straight to the Okta Verify app running in the system tray through its
+     local loopback server (`http://localhost:<port>`), exactly like the Okta sign-in page does. If Okta Verify is
+     not running, `aws-cred-mgr` starts it (`OktaVerify.exe`) and retries for a few seconds.
+3. Okta Verify asks you to approve (biometrics/PIN) when your org's policy requires it, `aws-cred-mgr` waits for
+   Okta to confirm and then continues with the AWS role selection / credential retrieval as usual.
 
 Requirements and troubleshooting:
 
 - Your Okta org must be on **Okta Identity Engine** and this device must be enrolled in Okta Verify with FastPass
   enabled by your Okta admin (Classic Engine orgs get a clear error suggesting `push`/`totp`).
 - Okta Verify must be installed on this device; if the app does not open, make sure it is installed and try again.
+- **Windows**: keep Okta Verify running (system tray) and signed in to your account. If the tool reports that Okta
+  redirected the sign-in to an external identity provider (`redirect-idp`), your org has an identity provider
+  routing rule for Windows devices that takes over as soon as the FastPass challenge is abandoned; the tool never
+  abandons it while Okta Verify can be reached, so make sure Okta Verify is up (or use `push`/`totp`).
 - The login times out after 2 minutes waiting for approval; simply rerun the command.
 - Run any command with the hidden `--log-level debug` option to write detailed diagnostics (including the Okta
   responses) to `~/.aws_cred_mgr/aws-cred-mgr.log` when reporting issues.

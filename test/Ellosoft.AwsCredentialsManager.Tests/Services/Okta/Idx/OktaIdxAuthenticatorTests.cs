@@ -232,6 +232,32 @@ public class OktaIdxAuthenticatorTests
     }
 
     [Fact]
+    public async Task AuthenticateAsync_WhenOktaRedirectsToAnExternalIdp_ShouldThrowExplainingTheRedirectWithoutFollowingIt()
+    {
+        // Windows shaped org: after the FastPass challenge is abandoned an IdP routing rule sends the sign-in to a browser redirect
+        _oktaHandler
+            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.IdentifyWithPassword)
+            .OnJson(HttpMethod.Post, IdentifyUrl, IdxPayloads.ChallengePollLoopback);
+
+        _challengeHandler
+            .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
+            .Returns(IdxResponse.Parse(IdxPayloads.RedirectIdpOnly));
+
+        var exception = await Should.ThrowAsync<OktaFastPassException>(() =>
+            _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));
+
+        exception.Message.ShouldContain("Contoso Entra ID");
+        exception.Message.ShouldContain("MICROSOFT");
+        exception.Message.ShouldContain("Okta Verify");
+        exception.Message.ShouldContain("routing rule");
+        exception.Message.ShouldNotContain("not supported by this tool");
+
+        // the redirect is a browser navigation (and following it would burn the sign-in transaction)
+        _oktaHandler.RequestsToPrefix(HttpMethod.Get, "https://xyz.okta.com/sso/idps/").ShouldBeEmpty();
+        _oktaHandler.RequestsTo(HttpMethod.Get, SuccessRedirectUrl).ShouldBeEmpty();
+    }
+
+    [Fact]
     public async Task AuthenticateAsync_WhenFastPassIsNotOffered_ShouldThrowListingOfferedAuthenticators()
     {
         var withoutFastPass = IdxPayloads.SelectAuthenticator.Replace("""{ "value": "signed_nonce", "label": "Use Okta FastPass" },""", string.Empty);

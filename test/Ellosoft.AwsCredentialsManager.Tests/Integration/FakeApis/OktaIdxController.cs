@@ -22,6 +22,8 @@ public class OktaIdxController : ControllerBase
 
     private static readonly ConcurrentDictionary<string, bool> ChallengeDelivered = new();
     private static readonly ConcurrentDictionary<string, bool> AppLaunchOffered = new();
+    private static readonly ConcurrentDictionary<string, bool> RoutesToIdpOnCancel = new();
+    private static readonly ConcurrentDictionary<string, bool> LoopbackListening = new();
 
     /// <summary>
     ///     Identity Engine orgs serve the End-User Dashboard SPA shell on the org root (no state token)
@@ -98,6 +100,10 @@ public class OktaIdxController : ControllerBase
     [HttpPost("/idp/idx/authenticators/poll/cancel")]
     public IActionResult CancelPolling([FromBody] JsonElement request)
     {
+        // orgs with an identity provider routing rule matching the client answer any cancellation with a browser redirect to the IdP
+        if (RoutesToIdpOnCancel.TryGetValue(CorrelationId, out var routesToIdp) && routesToIdp)
+            return Ion(RedirectIdp());
+
         // like a real Identity Engine org: when Okta Verify is not reachable through loopback Okta offers to open the app
         if (request.GetProperty("reason").GetString() == "OV_UNREACHABLE_BY_LOOPBACK")
             return Ion(OffersAppLaunch(CorrelationId) ? LaunchAuthenticator() : ChallengePoll());
@@ -128,17 +134,36 @@ public class OktaIdxController : ControllerBase
 
     private static bool OffersAppLaunch(string correlationId) => !AppLaunchOffered.TryGetValue(correlationId, out var offered) || offered;
 
+    /// <summary>
+    ///     Makes the fake org behave like an org with an identity provider routing rule matching the client (e.g. Windows devices):
+    ///     cancelling the FastPass challenge ends in a "redirect-idp" only response (default: false)
+    /// </summary>
+    public static void SetRoutesToIdpOnCancel(string correlationId, bool routesToIdp) => RoutesToIdpOnCancel[correlationId] = routesToIdp;
+
+    /// <summary>
+    ///     Controls whether the fake Okta Verify loopback server answers the probe (default: true). Simulates Okta Verify not running
+    /// </summary>
+    public static void SetLoopbackListening(string correlationId, bool listening) => LoopbackListening[correlationId] = listening;
+
+    private static bool IsLoopbackListening(string correlationId) => !LoopbackListening.TryGetValue(correlationId, out var listening) || listening;
+
     [HttpGet("/login/token/redirect")]
     public IActionResult SuccessRedirect() => Content("<html><body>Okta Dashboard</body></html>", "text/html");
+
+    [HttpGet("/sso/idps/{idpId}")]
+    public IActionResult IdpRedirect(string idpId) => Content($"<html><body>Redirecting to {idpId}...</body></html>", "text/html");
 
     // ---- fake Okta Verify loopback server ----
 
     [HttpGet("/probe")]
-    public IActionResult Probe() => Ok();
+    public IActionResult Probe() => IsLoopbackListening(CorrelationId) ? Ok() : NotFound();
 
     [HttpPost("/challenge")]
     public IActionResult Challenge([FromBody] JsonElement request)
     {
+        if (!IsLoopbackListening(CorrelationId))
+            return NotFound();
+
         if (request.GetProperty("challengeRequest").GetString() != ChallengeRequest)
             return BadRequest();
 
@@ -222,6 +247,27 @@ public class OktaIdxController : ControllerBase
                   "href": "{{BaseUrl}}/idp/idx/challenge",
                   "method": "POST",
                   "value": [ { "name": "stateHandle", "required": true, "value": "{{StateHandle}}", "visible": false, "mutable": false } ]
+                }
+              ]
+            }
+          }
+          """;
+
+    private string RedirectIdp() =>
+        $$"""
+          {
+            "version": "1.0.0",
+            "stateHandle": "{{StateHandle}}",
+            "intent": "LOGIN",
+            "remediation": {
+              "type": "array",
+              "value": [
+                {
+                  "name": "redirect-idp",
+                  "type": "MICROSOFT",
+                  "idp": { "id": "0oa1idpazure", "name": "Contoso Entra ID" },
+                  "href": "{{BaseUrl}}/sso/idps/0oa1idpazure?stateToken={{StateToken}}",
+                  "method": "GET"
                 }
               ]
             }

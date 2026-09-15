@@ -49,7 +49,7 @@ public class OktaIdxAuthenticator(
         // the cookies Okta sets during the sign-in (sid, idx, device token...) are the resulting session, keep them for later requests
         var sessionCookies = new CookieContainer();
 
-        using var idxClient = new IdxClient(httpClientFactory.CreateSessionClient(sessionCookies));
+        using var idxClient = new IdxClient(httpClientFactory.CreateSessionClient(sessionCookies), logger);
 
         var stateToken = await GetLoginPageStateTokenAsync(idxClient, oktaDomain, cancellationToken);
 
@@ -113,6 +113,9 @@ public class OktaIdxAuthenticator(
         if (response.GetRemediation(IdxResponse.SelectAuthenticatorRemediation) is { } selectAuthenticator)
             return await SelectAuthenticatorAsync(idxClient, response, selectAuthenticator, stateHandle, transaction, cancellationToken);
 
+        if (response.IdpRedirects.Count > 0)
+            throw IdpRedirectNotSupported(response, transaction);
+
         logger.LogError("Unsupported Okta Identity Engine remediation: {Remediations}", string.Join(", ", response.RemediationNames));
 
         // the full response carries the live state handle, only write it to the log file when debug logging is requested
@@ -120,6 +123,29 @@ public class OktaIdxAuthenticator(
 
         throw new OktaFastPassException(
             $"Okta requested a sign-in step that is not supported by this tool: {string.Join(", ", response.RemediationNames)}");
+    }
+
+    /// <summary>
+    ///     "redirect-idp" is a browser navigation to an external identity provider (identity provider routing rule or IdP
+    ///     authenticator). It usually shows up after the FastPass challenge was abandoned: Okta re-evaluates the routing
+    ///     rules for the sign-in and, for some clients (typically Windows), sends it to the IdP instead of Okta Verify
+    /// </summary>
+    private OktaFastPassException IdpRedirectNotSupported(IdxResponse response, Transaction transaction)
+    {
+        var idps = string.Join(" / ", response.IdpRedirects.Select(i => i.Description));
+
+        logger.LogError("Okta redirected the sign-in to {Idps} (redirect-idp), FastPass cannot continue outside a browser. Remediations: {Remediations}",
+            idps, string.Join(", ", response.RemediationNames));
+
+        var stage = transaction.Identified
+            ? "after the Okta Verify (FastPass) challenge could not be completed on this device"
+            : "before the user could be identified";
+
+        return new OktaFastPassException(
+            $"Okta redirected the sign-in to {idps} {stage}. This tool cannot complete an identity provider redirect (it needs a browser). " +
+            "This is typically caused by an Okta identity provider routing rule that applies to this device platform. " +
+            "Make sure Okta Verify is installed, enrolled with Okta FastPass and running on this device, then try again; " +
+            "or configure a different MFA type (push, totp). Run with '--log-level debug' and check the log file for the Okta responses");
     }
 
     private static Task<IdxResponse> IdentifyAsync(IdxClient idxClient, IdxResponse response, IdxRemediation identify, string stateHandle,

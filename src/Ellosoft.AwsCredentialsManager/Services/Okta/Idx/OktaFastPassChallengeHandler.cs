@@ -1,5 +1,6 @@
 // Copyright (c) 2026 Ellosoft Limited. All rights reserved.
 
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -53,8 +54,30 @@ public class OktaFastPassChallengeHandler(
     ///     When Okta offers the loopback binding first, ask Okta to open Okta Verify (deep link) right away instead of
     ///     probing the loopback ports: the app comes to the foreground with the approval prompt, and it also works when
     ///     Okta Verify is not running. Loopback is still used when Okta does not offer to open the app.
+    ///     <para>
+    ///         Not on Windows: cancelling the loopback challenge there hands the sign-in back to the Okta identifier step,
+    ///         which orgs commonly route to an external identity provider for Windows clients ("redirect-idp", a browser
+    ///         navigation this tool cannot follow). On Windows the challenge is delivered to the Okta Verify tray app
+    ///         through loopback, exactly like the Sign-In Widget does, and the app is started when it is not running.
+    ///     </para>
     /// </summary>
-    public bool PreferAppLaunch { get; set; } = true;
+    public bool PreferAppLaunch { get; set; } = !OperatingSystem.IsWindows();
+
+    /// <summary>
+    ///     When the loopback server does not answer, start Okta Verify and probe again (for up to <see cref="AppStartupTimeout" />)
+    ///     before asking Okta for another way to open the app
+    /// </summary>
+    public bool StartOktaVerifyWhenUnreachable { get; set; } = OperatingSystem.IsWindows();
+
+    /// <summary>
+    ///     How long to keep probing the loopback server after Okta Verify has been started
+    /// </summary>
+    public TimeSpan AppStartupTimeout { get; set; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>
+    ///     Delay between two loopback probes while waiting for Okta Verify to start
+    /// </summary>
+    public TimeSpan AppStartupProbeInterval { get; set; } = TimeSpan.FromSeconds(2);
 
     public async Task<IdxResponse> ExecuteAsync(IdxClient idxClient, Uri oktaDomain, IdxResponse challengeResponse, CancellationToken cancellationToken)
     {
@@ -104,6 +127,8 @@ public class OktaFastPassChallengeHandler(
 
     private async Task<IdxResponse> PollAsync(IdxClient idxClient, Uri oktaDomain, PollingContext context, CancellationToken cancellationToken)
     {
+        using var recovery = new LoopbackRecovery();
+
         var loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, cancellationToken);
 
         console.MarkupLine("Waiting for Okta Verify...");
@@ -113,12 +138,13 @@ public class OktaFastPassChallengeHandler(
             if (loopbackTask is { IsCompleted: true })
             {
                 var outcome = await loopbackTask;
-                loopbackTask = null;
 
-                var cancelResponse = await HandleLoopbackOutcomeAsync(idxClient, context, outcome, cancellationToken);
+                var nextStep = await HandleLoopbackOutcomeAsync(idxClient, oktaDomain, context, outcome, recovery, cancellationToken);
 
-                if (cancelResponse is not null)
-                    return cancelResponse;
+                if (nextStep.CancelResponse is not null)
+                    return nextStep.CancelResponse;
+
+                loopbackTask = nextStep.RetryTask;
             }
             else
             {
@@ -135,7 +161,10 @@ public class OktaFastPassChallengeHandler(
 
             // Okta issued a new challenge (e.g. user verification step-up), deliver it as well
             if (!IsSameChallenge(previousChallenge, context.Challenge))
+            {
+                recovery.CancelPendingRetry();
                 loopbackTask = await DeliverChallengeAsync(idxClient, oktaDomain, context, cancellationToken);
+            }
         }
     }
 
@@ -149,7 +178,7 @@ public class OktaFastPassChallengeHandler(
 
         if (challenge.IsLoopback)
         {
-            console.MarkupLine("Contacting Okta Verify on this device...");
+            console.MarkupLine("Contacting Okta Verify on this device... If Okta Verify asks you to confirm the sign-in, please approve it");
 
             return RunLoopbackAsync(challenge, oktaDomain, cancellationToken);
         }
@@ -166,21 +195,118 @@ public class OktaFastPassChallengeHandler(
         throw new OktaFastPassException("Unable to open Okta Verify. Please make sure Okta Verify is installed on this device and try again");
     }
 
-    private async Task<IdxResponse?> HandleLoopbackOutcomeAsync(IdxClient idxClient, PollingContext context, LoopbackOutcome outcome, CancellationToken cancellationToken)
+    /// <summary>
+    ///     Decides what happens after a loopback attempt: keep polling (delivered), probe again once Okta Verify has been
+    ///     started, or cancel the challenge and let Okta offer an alternative
+    /// </summary>
+    private async Task<LoopbackNextStep> HandleLoopbackOutcomeAsync(IdxClient idxClient, Uri oktaDomain, PollingContext context, LoopbackOutcome outcome,
+        LoopbackRecovery recovery, CancellationToken cancellationToken)
     {
         switch (outcome.Kind)
         {
-            case LoopbackOutcomeKind.Unreachable:
-                console.MarkupLine("[yellow]Okta Verify could not be reached on this device, trying to open the app instead...[/]");
+            case LoopbackOutcomeKind.Delivered:
+                console.MarkupLine("[green]Okta Verify answered the sign-in request[/], confirming with Okta...");
 
-                return await CancelPollingAsync(idxClient, context, REASON_UNREACHABLE, null, cancellationToken);
+                return LoopbackNextStep.KeepPolling;
+
+            case LoopbackOutcomeKind.Unreachable:
+                if (TryScheduleLoopbackRetry(oktaDomain, context, recovery, cancellationToken, out var retryTask))
+                    return new LoopbackNextStep(null, retryTask);
+
+                console.MarkupLine("[yellow]Okta Verify could not be reached on this device, asking Okta for another way to open it...[/]");
+
+                return new LoopbackNextStep(await CancelAndCheckForDeadEndAsync(idxClient, context, REASON_UNREACHABLE, null,
+                    $"could not be reached on this device (loopback ports {string.Join(", ", context.Challenge.Ports)})", cancellationToken), null);
 
             case LoopbackOutcomeKind.Error:
-                return await CancelPollingAsync(idxClient, context, REASON_ERROR, outcome.StatusCode, cancellationToken);
+                console.MarkupLine($"[yellow]Okta Verify rejected the sign-in request (HTTP {outcome.StatusCode}), asking Okta for another option...[/]");
+
+                return new LoopbackNextStep(await CancelAndCheckForDeadEndAsync(idxClient, context, REASON_ERROR, outcome.StatusCode,
+                    $"rejected the FastPass challenge (HTTP {outcome.StatusCode})", cancellationToken), null);
 
             default:
-                return null;
+                throw new InvalidOperationException($"Unknown loopback outcome {outcome.Kind}");
         }
+    }
+
+    /// <summary>
+    ///     Okta Verify is not listening: start it (once) and keep probing until <see cref="AppStartupTimeout" /> elapses
+    /// </summary>
+    private bool TryScheduleLoopbackRetry(Uri oktaDomain, PollingContext context, LoopbackRecovery recovery, CancellationToken cancellationToken,
+        [NotNullWhen(true)] out Task<LoopbackOutcome>? retryTask)
+    {
+        retryTask = null;
+
+        if (!StartOktaVerifyWhenUnreachable)
+            return false;
+
+        if (!recovery.AppStartAttempted)
+        {
+            recovery.AppStartAttempted = true;
+
+            console.MarkupLine("[yellow]Okta Verify is not reachable on this device, starting Okta Verify...[/]");
+
+            if (!appLauncher.TryStartApp())
+            {
+                console.MarkupLine("[yellow]Okta Verify could not be started[/]");
+
+                return false;
+            }
+
+            recovery.StartWaiting(AppStartupTimeout);
+        }
+        else if (!recovery.IsWaitingForApp)
+        {
+            logger.LogWarning("Okta Verify did not become reachable within {Timeout} after being started", AppStartupTimeout);
+
+            return false;
+        }
+
+        retryTask = recovery.ScheduleRetry(retryToken => RetryLoopbackAsync(context.Challenge, oktaDomain, retryToken), cancellationToken);
+
+        return true;
+    }
+
+    private async Task<LoopbackOutcome> RetryLoopbackAsync(IdxDeviceChallenge challenge, Uri oktaDomain, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(AppStartupProbeInterval, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // the retry was superseded by a new challenge (or the sign-in timed out), nothing to deliver anymore
+            return LoopbackOutcome.Unreachable;
+        }
+
+        logger.LogDebug("Probing the Okta Verify loopback server again");
+
+        return await RunLoopbackAsync(challenge, oktaDomain, cancellationToken);
+    }
+
+    /// <summary>
+    ///     Cancels the loopback challenge (Okta then decides the next step). When Okta answers with nothing but an
+    ///     identity provider redirect, the sign-in cannot continue outside a browser: fail with an explanation instead
+    ///     of surfacing an "unsupported step" error
+    /// </summary>
+    private async Task<IdxResponse> CancelAndCheckForDeadEndAsync(IdxClient idxClient, PollingContext context, string reason, int? statusCode,
+        string oktaVerifyFailure, CancellationToken cancellationToken)
+    {
+        var response = await CancelPollingAsync(idxClient, context, reason, statusCode, cancellationToken);
+
+        if (!response.IsIdpRedirectOnly)
+            return response;
+
+        var idps = string.Join(" / ", response.IdpRedirects.Select(i => i.Description));
+
+        logger.LogError("Okta Verify {Failure}; Okta answered the cancellation with an identity provider redirect only ({Idps})", oktaVerifyFailure, idps);
+
+        throw new OktaFastPassException(
+            $"Okta Verify {oktaVerifyFailure}, and Okta then redirected the sign-in to {idps} instead of offering another way to open Okta Verify " +
+            "(this is how Okta identity provider routing rules behave, typically for Windows clients). " +
+            "Okta FastPass can only complete when Okta Verify is installed, enrolled and running on this device: " +
+            "check the Okta Verify icon in the system tray (open the app and sign in if it asks you to), then try again. " +
+            "Alternatively configure a different MFA type (push, totp)");
     }
 
     /// <summary>
@@ -212,7 +338,13 @@ public class OktaFastPassChallengeHandler(
             try
             {
                 if (!await ProbeAsync(loopbackClient, baseUrl, probeTimeout, cancellationToken))
+                {
+                    logger.LogDebug("Okta Verify loopback probe at {BaseUrl} was not successful", baseUrl);
+
                     continue;
+                }
+
+                logger.LogDebug("Okta Verify is listening on {BaseUrl}, delivering the FastPass challenge", baseUrl);
 
                 using var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/challenge");
                 request.Headers.TryAddWithoutValidation("Origin", origin);
@@ -221,11 +353,19 @@ public class OktaFastPassChallengeHandler(
                 using var response = await loopbackClient.SendAsync(request, cancellationToken);
 
                 if (response.IsSuccessStatusCode)
+                {
+                    logger.LogDebug("Okta Verify at {BaseUrl} answered the challenge with status {StatusCode}", baseUrl, (int)response.StatusCode);
+
                     return LoopbackOutcome.Delivered;
+                }
 
                 // Okta Verify answers 503 when another OS user profile owns the port
                 if (response.StatusCode == HttpStatusCode.ServiceUnavailable)
+                {
+                    logger.LogDebug("Okta Verify at {BaseUrl} belongs to another OS user profile (503), trying the next port", baseUrl);
+
                     continue;
+                }
 
                 logger.LogError("Okta Verify loopback server at {BaseUrl} rejected the challenge with status {StatusCode}", baseUrl, (int)response.StatusCode);
 
@@ -236,6 +376,8 @@ public class OktaFastPassChallengeHandler(
                 logger.LogDebug(e, "Okta Verify is not listening on {BaseUrl}", baseUrl);
             }
         }
+
+        logger.LogInformation("Okta Verify loopback server not reachable on {Domain} ports {Ports}", domain, string.Join(", ", challenge.Ports));
 
         return LoopbackOutcome.Unreachable;
     }
@@ -288,6 +430,54 @@ public class OktaFastPassChallengeHandler(
             StateHandle = response.StateHandle ?? StateHandle,
             CancelHref = response.CancelPollingHref ?? CancelHref
         };
+    }
+
+    /// <summary>
+    ///     Tracks the "start Okta Verify and probe again" recovery of one polling session
+    /// </summary>
+    private sealed class LoopbackRecovery : IDisposable
+    {
+        private long _waitDeadlineTimestamp;
+        private CancellationTokenSource? _pendingRetry;
+
+        /// <summary>
+        ///     The polling session is over (success, error, cancellation): a retry still pending must not deliver anything
+        /// </summary>
+        public void Dispose() => CancelPendingRetry();
+
+        public bool AppStartAttempted { get; set; }
+
+        public bool IsWaitingForApp => Stopwatch.GetTimestamp() < _waitDeadlineTimestamp;
+
+        public void StartWaiting(TimeSpan duration) => _waitDeadlineTimestamp = Stopwatch.GetTimestamp() + (long)(duration.TotalSeconds * Stopwatch.Frequency);
+
+        public Task<LoopbackOutcome> ScheduleRetry(Func<CancellationToken, Task<LoopbackOutcome>> retry, CancellationToken cancellationToken)
+        {
+            CancelPendingRetry();
+
+            _pendingRetry = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            return retry(_pendingRetry.Token);
+        }
+
+        /// <summary>
+        ///     A retry still waiting for its turn must not deliver a challenge Okta has already replaced
+        /// </summary>
+        public void CancelPendingRetry()
+        {
+            _pendingRetry?.Cancel();
+            _pendingRetry?.Dispose();
+            _pendingRetry = null;
+        }
+    }
+
+    /// <summary>
+    ///     What the polling loop does after a loopback attempt: return Okta's answer to the cancellation, wait for a
+    ///     scheduled loopback retry, or just keep polling
+    /// </summary>
+    private sealed record LoopbackNextStep(IdxResponse? CancelResponse, Task<LoopbackOutcome>? RetryTask)
+    {
+        public static readonly LoopbackNextStep KeepPolling = new(null, null);
     }
 
     private enum LoopbackOutcomeKind
