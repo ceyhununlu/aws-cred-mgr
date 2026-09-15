@@ -188,23 +188,35 @@ public class OktaIdxAuthenticator(
             return IdxResponse.Parse(SessionEstablishedResponse);
         }
 
-        if (OktaLoginPageStateTokenExtractor.Extract(result.Content) is { } stateToken)
+        // only resume from a returned sign-in page when Kerberos was actually attempted (otherwise the page carries the
+        // original, now-consumed state token and re-introspecting it just yields Okta's misleading "session has expired")
+        if (result.NegotiateChallengeSeen && !result.KerberosRejected && OktaLoginPageStateTokenExtractor.Extract(result.Content) is { } stateToken)
         {
             logger.LogDebug("Desktop SSO ended on a sign-in page with a new state token (final URL: {FinalUrl}, HTTP {StatusCode}), resuming the sign-in",
                 result.FinalUrl, (int)result.StatusCode);
 
-            if (result.KerberosRejected)
-                console.MarkupLine("[yellow]Desktop Single Sign-on (Kerberos) was not accepted, continuing with the Okta sign-in...[/]");
-
             return await idxClient.PostAsync(new Uri(oktaDomain, "/idp/idx/introspect").ToString(), new JsonObject { ["stateToken"] = stateToken }, cancellationToken);
         }
 
-        logger.LogError("Desktop SSO did not establish an Okta session: final URL {FinalUrl}, HTTP {StatusCode}, Kerberos host: {KerberosHost}",
-            result.FinalUrl, (int)result.StatusCode, result.KerberosHost ?? "none");
+        logger.LogError("Desktop SSO did not establish an Okta session: final URL {FinalUrl}, HTTP {StatusCode}, Kerberos host: {KerberosHost}, Negotiate challenge seen: {NegotiateChallengeSeen}",
+            result.FinalUrl, (int)result.StatusCode, result.KerberosHost ?? "none", result.NegotiateChallengeSeen);
 
-        var kerberosOutcome = result.KerberosRejected
-            ? $"{result.KerberosHost ?? result.FinalUrl.Host} rejected the Kerberos sign-in (HTTP 401)"
-            : $"the sign-in ended at {result.FinalUrl.GetLeftPart(UriPartial.Path)} (HTTP {(int)result.StatusCode}) without an Okta session";
+        string kerberosOutcome;
+
+        if (result.KerberosRejected)
+        {
+            kerberosOutcome = $"{result.KerberosHost ?? result.FinalUrl.Host} rejected the Kerberos sign-in (HTTP 401). " +
+                              "Kerberos was attempted but no valid ticket was accepted";
+        }
+        else if (!result.NegotiateChallengeSeen)
+        {
+            kerberosOutcome = $"Okta never issued a Kerberos (Negotiate) challenge (the sign-in ended at {result.FinalUrl.GetLeftPart(UriPartial.Path)}, " +
+                              $"HTTP {(int)result.StatusCode}). Okta served a page instead of challenging this device for a ticket";
+        }
+        else
+        {
+            kerberosOutcome = $"the sign-in ended at {result.FinalUrl.GetLeftPart(UriPartial.Path)} (HTTP {(int)result.StatusCode}) without an Okta session";
+        }
 
         throw new OktaFastPassException($"Okta routed the sign-in to Desktop Single Sign-on ({redirect.Description}) but {kerberosOutcome}. " + DesktopSsoTroubleshooting);
     }

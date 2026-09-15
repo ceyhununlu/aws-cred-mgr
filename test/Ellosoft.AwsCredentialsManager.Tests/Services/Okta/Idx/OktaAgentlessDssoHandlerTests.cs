@@ -61,6 +61,53 @@ public class OktaAgentlessDssoHandlerTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_WhenTheKerberosPageBouncesViaMetaRefresh_ShouldFollowItToTheChallenge()
+    {
+        // Okta serves the DSSO step as a 200 page that meta-refreshes to the real Kerberos challenge URL
+        const string bouncePage = """<html><head><meta http-equiv="refresh" content="0; url=https://xyz.kerberos.okta.com/login/agentlessDsso?stateToken=02state-handle"></head></html>""";
+
+        _httpHandler
+            .On(HttpMethod.Get, IdpRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(bouncePage)))
+            .On(HttpMethod.Get, KerberosUrl, _ =>
+            {
+                var challenged = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("ok") };
+                challenged.Headers.WwwAuthenticate.Add(new AuthenticationHeaderValue("Negotiate", "oYAB"));
+                return Task.FromResult(challenged);
+            });
+
+        var result = await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);
+
+        result.NegotiateChallengeSeen.ShouldBeTrue();
+        result.KerberosHost.ShouldBe("xyz.kerberos.okta.com");
+        _httpHandler.Requests.Select(r => r.Url).ShouldBe([IdpRedirectUrl, KerberosUrl]);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenOktaNeverChallengesForKerberos_ShouldReportNoNegotiateChallenge()
+    {
+        _httpHandler.On(HttpMethod.Get, IdpRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html><body>please sign in</body></html>")));
+
+        var result = await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);
+
+        result.NegotiateChallengeSeen.ShouldBeFalse();
+        result.KerberosHost.ShouldBeNull();
+        result.KerberosRejected.ShouldBeFalse();
+    }
+
+    [Theory]
+    [InlineData("""<meta http-equiv="refresh" content="0;url=/login/step2">""", "https://xyz.okta.com/login/step2")]
+    [InlineData("""<META HTTP-EQUIV='refresh' CONTENT='0; URL=https://xyz.kerberos.okta.com/x'>""", "https://xyz.kerberos.okta.com/x")]
+    [InlineData("<script>window.location.href = 'https://xyz.okta.com/next';</script>", "https://xyz.okta.com/next")]
+    [InlineData("<script>location.replace('/relative/path')</script>", "https://xyz.okta.com/relative/path")]
+    [InlineData("<html><body>no redirect here</body></html>", null)]
+    public void ExtractHtmlRedirect_ShouldFindClientSideRedirects(string html, string? expected)
+    {
+        var result = OktaAgentlessDssoHandler.ExtractHtmlRedirect(html, new Uri("https://xyz.okta.com/login/agentlessDsso"));
+
+        result?.ToString().ShouldBe(expected);
+    }
+
+    [Fact]
     public async Task ExecuteAsync_ShouldOnlyOfferTheKerberosTicketToOktaHosts()
     {
         _httpHandler

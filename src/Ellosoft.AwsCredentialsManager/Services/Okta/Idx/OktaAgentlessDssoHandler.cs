@@ -2,6 +2,7 @@
 
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text.RegularExpressions;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Exceptions;
 using Microsoft.Extensions.Logging;
 
@@ -29,7 +30,8 @@ public interface IOktaAgentlessDssoHandler
 /// <param name="StatusCode">Status code of the last response</param>
 /// <param name="Content">Body of the last response (Okta sign-in page or dashboard HTML)</param>
 /// <param name="KerberosHost">Host that issued the Negotiate challenge, if any</param>
-public sealed record AgentlessDssoResult(Uri FinalUrl, HttpStatusCode StatusCode, string Content, string? KerberosHost)
+/// <param name="NegotiateChallengeSeen">Whether any hop actually asked for a Kerberos (Negotiate) ticket</param>
+public sealed record AgentlessDssoResult(Uri FinalUrl, HttpStatusCode StatusCode, string Content, string? KerberosHost, bool NegotiateChallengeSeen)
 {
     /// <summary>
     ///     The Kerberos endpoint refused the sign-in (no ticket, NTLM instead of Kerberos, clock skew...)
@@ -42,13 +44,14 @@ public sealed record AgentlessDssoResult(Uri FinalUrl, HttpStatusCode StatusCode
 ///     host, the client presents the Kerberos ticket of the signed-in OS user (SPN HTTP/{org}.kerberos.okta.com) and Okta
 ///     signs the user in. On Windows .NET uses SSPI for this, so the CLI can complete the flow without a browser.
 /// </summary>
-public class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClientFactory, IAnsiConsole console, ILogger<OktaAgentlessDssoHandler> logger)
+public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClientFactory, IAnsiConsole console, ILogger<OktaAgentlessDssoHandler> logger)
     : IOktaAgentlessDssoHandler
 {
     public const string IdpType = "AgentlessDSSO";
 
     private const string NegotiateScheme = "Negotiate";
     private const int MaxRedirects = 15;
+    private const int LoggedBodySnippetLength = 800;
 
     private static readonly string[] OktaKerberosDomains = [".kerberos.okta.com", ".kerberos.oktapreview.com", ".kerberos.okta-emea.com"];
 
@@ -65,35 +68,74 @@ public class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClientFactor
 
         var url = new Uri(oktaDomain, redirect.Href);
         string? kerberosHost = null;
+        var negotiateChallengeSeen = false;
 
         for (var hop = 0; hop <= MaxRedirects; hop++)
         {
-            if (IsTrustedOktaHost(url, oktaDomain))
-                TrustHost(credentials, url);
-            else
-                logger.LogWarning("Desktop SSO redirected to {Host}, which is not an Okta host: the Kerberos ticket will not be presented to it", url.Host);
+            PrepareCredentials(credentials, url, oktaDomain);
 
             using var response = await SendAsync(httpClient, url, hop, cancellationToken);
 
+            // .NET answers the 401 Negotiate internally, so a challenge shows up either as a lingering 401 (rejected) or as
+            // the WWW-Authenticate header echoed on the final response; either way it proves Okta asked for the Kerberos ticket
             if (response.StatusCode == HttpStatusCode.Unauthorized || response.Headers.WwwAuthenticate.Any(h => h.Scheme == NegotiateScheme))
-                kerberosHost ??= url.Host;
-
-            if (IsRedirect(response.StatusCode) && response.Headers.Location is { } location)
             {
-                url = location.IsAbsoluteUri ? location : new Uri(url, location);
+                negotiateChallengeSeen = true;
+                kerberosHost ??= url.Host;
+            }
+
+            if (GetRedirectLocation(response, url) is { } location)
+            {
+                url = location;
 
                 continue;
             }
 
             var content = await response.Content.ReadAsStringAsync(cancellationToken);
 
+            LogFinalResponse(hop, url, response, content);
+
+            // Okta serves the agentless DSSO step as a 200 HTML page that bounces to the Kerberos challenge URL via
+            // meta-refresh / script; a browser follows it, so must we (otherwise Kerberos is never actually attempted)
+            if (GetHtmlRedirect(response, content, url, oktaDomain) is { } htmlRedirect)
+            {
+                logger.LogDebug("Desktop SSO hop {Hop}: following in-page redirect to {Url}", hop, htmlRedirect);
+                url = htmlRedirect;
+
+                continue;
+            }
+
             if (response.StatusCode == HttpStatusCode.Unauthorized)
                 logger.LogError("Desktop SSO: {Host} rejected the Kerberos sign-in (401). WWW-Authenticate: {Challenge}", url.Host, response.Headers.WwwAuthenticate);
 
-            return new AgentlessDssoResult(url, response.StatusCode, content, kerberosHost);
+            return new AgentlessDssoResult(url, response.StatusCode, content, kerberosHost, negotiateChallengeSeen);
         }
 
         throw new OktaFastPassException($"Desktop Single Sign-on did not complete: Okta kept redirecting (more than {MaxRedirects} redirects), last URL: {url}");
+    }
+
+    private void PrepareCredentials(CredentialCache credentials, Uri url, Uri oktaDomain)
+    {
+        if (IsTrustedOktaHost(url, oktaDomain))
+            TrustHost(credentials, url);
+        else
+            logger.LogWarning("Desktop SSO redirected to {Host}, which is not an Okta host: the Kerberos ticket will not be presented to it", url.Host);
+    }
+
+    private static Uri? GetRedirectLocation(HttpResponseMessage response, Uri currentUrl)
+    {
+        if (!IsRedirect(response.StatusCode) || response.Headers.Location is not { } location)
+            return null;
+
+        return location.IsAbsoluteUri ? location : new Uri(currentUrl, location);
+    }
+
+    private static Uri? GetHtmlRedirect(HttpResponseMessage response, string content, Uri currentUrl, Uri oktaDomain)
+    {
+        if (response.StatusCode != HttpStatusCode.OK)
+            return null;
+
+        return ExtractHtmlRedirect(content, currentUrl) is { } htmlRedirect && IsTrustedOktaHost(htmlRedirect, oktaDomain) ? htmlRedirect : null;
     }
 
     private async Task<HttpResponseMessage> SendAsync(HttpClient httpClient, Uri url, int hop, CancellationToken cancellationToken)
@@ -111,7 +153,12 @@ public class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClientFactor
         {
             var response = await httpClient.SendAsync(request, cancellationToken);
 
-            logger.LogDebug("Desktop SSO hop {Hop}: GET {Url} -> {StatusCode}", hop, url, (int)response.StatusCode);
+            var wwwAuthenticate = response.Headers.WwwAuthenticate.Count > 0
+                ? string.Join(", ", response.Headers.WwwAuthenticate.Select(h => h.Scheme))
+                : "none";
+
+            logger.LogDebug("Desktop SSO hop {Hop}: GET {Url} -> {StatusCode} (WWW-Authenticate: {WwwAuthenticate}, Location: {Location}, Content-Type: {ContentType})",
+                hop, url, (int)response.StatusCode, wwwAuthenticate, response.Headers.Location?.ToString() ?? "none", response.Content.Headers.ContentType?.ToString() ?? "none");
 
             return response;
         }
@@ -124,6 +171,47 @@ public class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClientFactor
                 "This device must be able to reach Okta's Kerberos endpoint and a domain controller (corporate network or VPN)");
         }
     }
+
+    private void LogFinalResponse(int hop, Uri url, HttpResponseMessage response, string content)
+    {
+        if (!logger.IsEnabled(LogLevel.Debug))
+            return;
+
+        var snippet = content.Length > LoggedBodySnippetLength ? content[..LoggedBodySnippetLength] + "..." : content;
+
+        logger.LogDebug("Desktop SSO hop {Hop}: {Url} settled at HTTP {StatusCode} ({Length} bytes). Body: {Body}",
+            hop, url, (int)response.StatusCode, content.Length, snippet);
+    }
+
+    /// <summary>
+    ///     Finds the URL an HTML page bounces to without a real HTTP redirect: meta-refresh or a plain
+    ///     <c>window.location = '...'</c> / <c>location.replace('...')</c> assignment
+    /// </summary>
+    public static Uri? ExtractHtmlRedirect(string html, Uri baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+            return null;
+
+        var match = MetaRefreshRegex().Match(html);
+
+        if (!match.Success)
+            match = JsLocationRegex().Match(html);
+
+        if (!match.Success)
+            return null;
+
+        var target = WebUtility.HtmlDecode(match.Groups["url"].Value).Trim();
+
+        return Uri.TryCreate(baseUrl, target, out var uri) ? uri : null;
+    }
+
+    [GeneratedRegex("""<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["'][^"']*url\s*=\s*(?<url>[^"']+)["']""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex MetaRefreshRegex();
+
+    [GeneratedRegex("""(?:window\.)?location(?:\.href)?\s*=\s*["'](?<url>[^"']+)["']|location\.replace\(\s*["'](?<url>[^"']+)["']""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex JsLocationRegex();
 
     /// <summary>
     ///     Only Okta's own hosts may challenge for the Kerberos ticket: the org (including custom domains), the org's

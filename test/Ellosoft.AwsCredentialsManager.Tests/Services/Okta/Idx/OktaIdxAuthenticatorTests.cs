@@ -270,7 +270,7 @@ public class OktaIdxAuthenticatorTests
 
         _desktopSsoHandler
             .ExecuteAsync(new Uri(OktaDomain), Arg.Is<IdxIdpRedirect>(r => r.Type == "AgentlessDSSO"), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
-            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/enduser/callback?code=1"), HttpStatusCode.OK, DashboardShell, "xyz.kerberos.okta.com"));
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/enduser/callback?code=1"), HttpStatusCode.OK, DashboardShell, "xyz.kerberos.okta.com", NegotiateChallengeSeen: true));
 
         var result = await _authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None);
 
@@ -305,7 +305,7 @@ public class OktaIdxAuthenticatorTests
 
         _desktopSsoHandler
             .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
-            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/default"), HttpStatusCode.OK, fallbackLoginPage, "xyz.kerberos.okta.com"));
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/default"), HttpStatusCode.OK, fallbackLoginPage, "xyz.kerberos.okta.com", NegotiateChallengeSeen: true));
 
         _challengeHandler
             .ExecuteAsync(Arg.Any<IdxClient>(), Arg.Any<Uri>(), Arg.Any<IdxResponse>(), Arg.Any<CancellationToken>())
@@ -342,7 +342,7 @@ public class OktaIdxAuthenticatorTests
 
         _desktopSsoHandler
             .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
-            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/default"), HttpStatusCode.OK, fallbackLoginPage, "xyz.kerberos.okta.com"));
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/default"), HttpStatusCode.OK, fallbackLoginPage, "xyz.kerberos.okta.com", NegotiateChallengeSeen: true));
 
         var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
 
@@ -367,7 +367,7 @@ public class OktaIdxAuthenticatorTests
 
         _desktopSsoHandler
             .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
-            .Returns(new AgentlessDssoResult(new Uri("https://xyz.kerberos.okta.com/login/agentlessDsso"), HttpStatusCode.Unauthorized, string.Empty, "xyz.kerberos.okta.com"));
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.kerberos.okta.com/login/agentlessDsso"), HttpStatusCode.Unauthorized, string.Empty, "xyz.kerberos.okta.com", NegotiateChallengeSeen: true));
 
         var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
 
@@ -377,6 +377,37 @@ public class OktaIdxAuthenticatorTests
         exception.Message.ShouldContain("xyz.kerberos.okta.com rejected the Kerberos sign-in (HTTP 401)");
         exception.Message.ShouldContain("domain-joined");
         exception.Message.ShouldNotContain("needs a browser");
+    }
+
+    [Fact]
+    public async Task AuthenticateAsync_WhenOktaNeverIssuesTheKerberosChallenge_ShouldThrowWithoutReintrospectingAStaleToken()
+    {
+        // Okta returned a page (still carrying the original, now-consumed state token) without ever challenging for Kerberos:
+        // re-introspecting it would only yield Okta's misleading "session has expired", so the tool must not do it
+        const string pageWithOriginalToken = """<html><script>var stateToken = '02state\x2Dtoken';</script></html>""";
+
+        var handler = new FakeHttpMessageHandler()
+            .OnPrefix(HttpMethod.Get, SignInPageUrlPrefix, _ => Task.FromResult(FakeHttpMessageHandler.Html(LoginPage)))
+            .OnJson(HttpMethod.Post, IntrospectUrl, IdxPayloads.RedirectAgentlessDsso)
+            .OnStatus(HttpMethod.Get, SessionsMeUrl, HttpStatusCode.NotFound);
+
+        var httpClientFactory = Substitute.For<IOktaIdxHttpClientFactory>();
+        httpClientFactory.CreateSessionClient(Arg.Any<CookieContainer>()).Returns(_ => new HttpClient(handler));
+
+        _desktopSsoHandler
+            .ExecuteAsync(Arg.Any<Uri>(), Arg.Any<IdxIdpRedirect>(), Arg.Any<CookieContainer>(), Arg.Any<CancellationToken>())
+            .Returns(new AgentlessDssoResult(new Uri("https://xyz.okta.com/login/agentlessDsso"), HttpStatusCode.OK, pageWithOriginalToken, KerberosHost: null, NegotiateChallengeSeen: false));
+
+        var authenticator = new OktaIdxAuthenticator(httpClientFactory, _challengeHandler, _desktopSsoHandler, _console, NullLogger<OktaIdxAuthenticator>.Instance);
+
+        var exception = await Should.ThrowAsync<OktaFastPassException>(() =>
+            authenticator.AuthenticateAsync(new Uri(OktaDomain), "john@xyz.com", "P@ssw0rd", CancellationToken.None));
+
+        exception.Message.ShouldContain("never issued a Kerberos (Negotiate) challenge");
+        exception.Message.ShouldContain("klist");
+
+        // the stale original token was never re-introspected (only the very first introspect happened)
+        handler.RequestsTo(HttpMethod.Post, IntrospectUrl).Count().ShouldBe(1);
     }
 
     [Fact]
