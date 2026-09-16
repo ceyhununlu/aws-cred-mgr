@@ -102,7 +102,10 @@ Requirements and troubleshooting:
   `https://<org>.kerberos.okta.com/login/agentlessDsso` and answers the Kerberos challenge with your Windows
   account (no prompt). This needs a domain-joined device that can reach a domain controller (corporate network or
   VPN); `klist` should show a ticket for `HTTP/<org>.kerberos.okta.com` after a sign-in. If Okta then still asks
-  for MFA, the FastPass flow continues from the page Okta returns.
+  for MFA, the FastPass flow continues from the page Okta returns. When the identity provider redirect does not
+  lead to a Kerberos challenge, the tool falls back to Okta's documented direct entry point
+  `https://<org>.okta.com/login/agentlessDsso`. With `--log-level debug` every hop is logged and the last page Okta
+  returned is saved to `~/.aws_cred_mgr/okta-dsso-response.html` for troubleshooting.
 - The login times out after 2 minutes waiting for approval; simply rerun the command.
 - Run any command with the hidden `--log-level debug` option to write detailed diagnostics (including the Okta
   responses) to `~/.aws_cred_mgr/aws-cred-mgr.log` when reporting issues.

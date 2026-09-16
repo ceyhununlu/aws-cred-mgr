@@ -17,6 +17,7 @@ public class OktaAgentlessDssoHandlerTests
     private const string KerberosUrl = "https://xyz.kerberos.okta.com/login/agentlessDsso?stateToken=02state-handle";
     private const string DssoCallbackUrl = "https://xyz.okta.com/login/agentlessDsso/redirect?token=abc";
     private const string DashboardCallbackUrl = "https://xyz.okta.com/enduser/callback?code=xyz&state=123";
+    private const string DirectEndpointUrl = "https://xyz.okta.com/login/agentlessDsso";
 
     private static readonly IdxIdpRedirect Redirect = new("AgentlessDSSO", "AgentlessDSSO", IdpRedirectUrl);
 
@@ -41,7 +42,7 @@ public class OktaAgentlessDssoHandlerTests
         // Okta -> org Kerberos endpoint (Negotiate handled by the HTTP stack) -> Okta callback -> dashboard callback
         _httpHandler
             .OnRedirect(HttpMethod.Get, IdpRedirectUrl, KerberosUrl)
-            .OnRedirect(HttpMethod.Get, KerberosUrl, DssoCallbackUrl)
+            .OnKerberosRedirect(HttpMethod.Get, KerberosUrl, DssoCallbackUrl)
             .OnRedirect(HttpMethod.Get, DssoCallbackUrl, "/enduser/callback?code=xyz&state=123")
             .On(HttpMethod.Get, DashboardCallbackUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html>dashboard</html>")));
 
@@ -83,15 +84,67 @@ public class OktaAgentlessDssoHandlerTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_WhenOktaNeverChallengesForKerberos_ShouldReportNoNegotiateChallenge()
+    public async Task ExecuteAsync_WhenTheIdpRedirectServesAPage_ShouldFallBackToTheDocumentedDirectDssoEndpoint()
     {
-        _httpHandler.On(HttpMethod.Get, IdpRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html><body>please sign in</body></html>")));
+        // GET /sso/idps/DSSO?stateToken=... answers 200 with a page (what the user's org does) instead of bouncing to Kerberos:
+        // the documented https://{org}/login/agentlessDsso entry point is used instead
+        _httpHandler
+            .On(HttpMethod.Get, IdpRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html><title>Verizon Connect Inc. - Sign In</title><body>widget</body></html>")))
+            .OnRedirect(HttpMethod.Get, DirectEndpointUrl, KerberosUrl)
+            .OnKerberosRedirect(HttpMethod.Get, KerberosUrl, DssoCallbackUrl)
+            .OnRedirect(HttpMethod.Get, DssoCallbackUrl, DashboardCallbackUrl)
+            .On(HttpMethod.Get, DashboardCallbackUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html>dashboard</html>")));
+
+        var result = await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);
+
+        result.NegotiateChallengeSeen.ShouldBeTrue();
+        result.KerberosHost.ShouldBe("xyz.kerberos.okta.com");
+        result.FinalUrl.ToString().ShouldBe(DashboardCallbackUrl);
+
+        _httpHandler.Requests.Select(r => r.Url).ShouldBe([IdpRedirectUrl, DirectEndpointUrl, KerberosUrl, DssoCallbackUrl, DashboardCallbackUrl]);
+        // the test console wraps long lines
+        _console.Output.ReplaceLineEndings(" ").ShouldContain("trying the Desktop SSO endpoint directly");
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenNeitherTheIdpRedirectNorTheDirectEndpointChallengeForKerberos_ShouldReportNoNegotiateChallenge()
+    {
+        _httpHandler
+            .On(HttpMethod.Get, IdpRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html><body>please sign in</body></html>")))
+            .On(HttpMethod.Get, DirectEndpointUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html><body>please sign in</body></html>")));
 
         var result = await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);
 
         result.NegotiateChallengeSeen.ShouldBeFalse();
         result.KerberosHost.ShouldBeNull();
         result.KerberosRejected.ShouldBeFalse();
+        result.FinalUrl.ToString().ShouldBe(DirectEndpointUrl);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_WhenAnInterstitialPageAutoSubmitsAForm_ShouldPostItToTheNextStep()
+    {
+        // Okta interstitial: hidden form posted by script to the next step
+        const string interstitial = """
+            <html><body onload="document.forms[0].submit()">
+            <form id="appForm" method="POST" action="https://xyz.kerberos.okta.com/login/agentlessDsso">
+              <input type="hidden" name="stateToken" value="02state&#45;handle" />
+              <input type="hidden" name="fromURI" value="/app/dashboard" />
+            </form>
+            </body></html>
+            """;
+
+        _httpHandler
+            .On(HttpMethod.Get, IdpRedirectUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(interstitial)))
+            .On(HttpMethod.Post, "https://xyz.kerberos.okta.com/login/agentlessDsso", _ => Task.FromResult(FakeHttpMessageHandler.KerberosRedirect(DashboardCallbackUrl)))
+            .On(HttpMethod.Get, DashboardCallbackUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html("<html>dashboard</html>")));
+
+        var result = await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);
+
+        result.NegotiateChallengeSeen.ShouldBeTrue();
+
+        var post = _httpHandler.RequestsTo(HttpMethod.Post, "https://xyz.kerberos.okta.com/login/agentlessDsso").ShouldHaveSingleItem();
+        post.Body.ShouldBe("stateToken=02state-handle&fromURI=%2Fapp%2Fdashboard");
     }
 
     [Theory]
@@ -99,6 +152,9 @@ public class OktaAgentlessDssoHandlerTests
     [InlineData("""<META HTTP-EQUIV='refresh' CONTENT='0; URL=https://xyz.kerberos.okta.com/x'>""", "https://xyz.kerberos.okta.com/x")]
     [InlineData("<script>window.location.href = 'https://xyz.okta.com/next';</script>", "https://xyz.okta.com/next")]
     [InlineData("<script>location.replace('/relative/path')</script>", "https://xyz.okta.com/relative/path")]
+    [InlineData("<script>window.location.assign(\"/assigned\")</script>", "https://xyz.okta.com/assigned")]
+    [InlineData("<script>document.location = '/doc';</script>", "https://xyz.okta.com/doc")]
+    [InlineData("""<form action="/manual" method="post"><input type="text" name="user"></form>""", null)]
     [InlineData("<html><body>no redirect here</body></html>", null)]
     public void ExtractHtmlRedirect_ShouldFindClientSideRedirects(string html, string? expected)
     {
@@ -108,11 +164,22 @@ public class OktaAgentlessDssoHandlerTests
     }
 
     [Fact]
+    public void ExtractHtmlNavigation_WithAutoSubmittedGetForm_ShouldPutTheFieldsInTheQueryString()
+    {
+        const string html = """<form action="/next?a=1" method="get"><input type="hidden" name="b" value="2"></form><script>document.forms[0].submit();</script>""";
+
+        var navigation = OktaAgentlessDssoHandler.ExtractHtmlNavigation(html, new Uri("https://xyz.okta.com/login/agentlessDsso")).ShouldNotBeNull();
+
+        navigation.Method.ShouldBe(HttpMethod.Get);
+        navigation.Url.ToString().ShouldBe("https://xyz.okta.com/next?a=1&b=2");
+    }
+
+    [Fact]
     public async Task ExecuteAsync_ShouldOnlyOfferTheKerberosTicketToOktaHosts()
     {
         _httpHandler
             .OnRedirect(HttpMethod.Get, IdpRedirectUrl, KerberosUrl)
-            .OnRedirect(HttpMethod.Get, KerberosUrl, "https://evil.example.com/steal")
+            .OnKerberosRedirect(HttpMethod.Get, KerberosUrl, "https://evil.example.com/steal")
             .On(HttpMethod.Get, "https://evil.example.com/steal", _ => Task.FromResult(FakeHttpMessageHandler.Html("<html/>")));
 
         await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);
@@ -153,7 +220,7 @@ public class OktaAgentlessDssoHandlerTests
 
         _httpHandler
             .OnRedirect(HttpMethod.Get, IdpRedirectUrl, KerberosUrl)
-            .OnRedirect(HttpMethod.Get, KerberosUrl, "https://xyz.okta.com/login/default")
+            .OnKerberosRedirect(HttpMethod.Get, KerberosUrl, "https://xyz.okta.com/login/default")
             .On(HttpMethod.Get, "https://xyz.okta.com/login/default", _ => Task.FromResult(FakeHttpMessageHandler.Html(loginPage)));
 
         var result = await _handler.ExecuteAsync(new Uri(OktaDomain), Redirect, _cookies, CancellationToken.None);

@@ -173,12 +173,16 @@ public class OktaIdxController : ControllerBase
     // ---- fake Agentless Desktop SSO (Kerberos) endpoint: a browser gets a 401 Negotiate here and answers with its ticket ----
 
     [HttpGet("/login/agentlessDsso")]
-    public IActionResult AgentlessDsso([FromQuery] string stateToken)
+    public IActionResult AgentlessDsso([FromQuery] string? stateToken)
     {
+        // the org host entry point (Okta's documented direct DSSO URL) hands over to the Kerberos host
         if (!Request.Host.Host.Contains(".kerberos.", StringComparison.OrdinalIgnoreCase))
-            return BadRequest("Agentless DSSO is only served on the org Kerberos host");
+            return Redirect($"{Request.Scheme}://{KerberosHost}/login/agentlessDsso?stateToken={stateToken}");
 
         var orgHost = Request.Host.Host.Replace(".kerberos.", ".", StringComparison.OrdinalIgnoreCase);
+
+        // a successful Negotiate exchange ends with the server echoing the mutual authentication token
+        Response.Headers.WWWAuthenticate = "Negotiate oRQwEqADCgEAoQsGCSqGSIb3EgECAg==";
 
         return Redirect($"{Request.Scheme}://{orgHost}/login/agentlessDsso/redirect?token=kerberos-ok&stateToken={stateToken}");
     }

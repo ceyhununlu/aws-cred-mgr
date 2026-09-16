@@ -40,6 +40,14 @@ public sealed record AgentlessDssoResult(Uri FinalUrl, HttpStatusCode StatusCode
 }
 
 /// <summary>
+///     A navigation an HTML page performs on its own: meta-refresh, <c>window.location = ...</c> or an auto-submitted form
+/// </summary>
+public sealed record HtmlNavigation(Uri Url, HttpMethod Method, IReadOnlyDictionary<string, string> FormFields)
+{
+    public static HtmlNavigation Get(Uri url) => new(url, HttpMethod.Get, new Dictionary<string, string>());
+}
+
+/// <summary>
 ///     Okta Agentless Desktop Single Sign-on: Okta answers with a 401 "WWW-Authenticate: Negotiate" on the org Kerberos
 ///     host, the client presents the Kerberos ticket of the signed-in OS user (SPN HTTP/{org}.kerberos.okta.com) and Okta
 ///     signs the user in. On Windows .NET uses SSPI for this, so the CLI can complete the flow without a browser.
@@ -48,6 +56,17 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
     : IOktaAgentlessDssoHandler
 {
     public const string IdpType = "AgentlessDSSO";
+
+    /// <summary>
+    ///     Okta's documented direct Desktop SSO entry point ("sign in using the direct agentless DSSO endpoint URL"):
+    ///     redirects to the org Kerberos host, runs the Negotiate handshake and creates the Okta session
+    /// </summary>
+    public const string DirectEndpointPath = "/login/agentlessDsso";
+
+    /// <summary>
+    ///     The last page the Desktop SSO chain settled on is saved here when debug logging is on (redirect diagnostics)
+    /// </summary>
+    public const string CapturedPageFileName = "okta-dsso-response.html";
 
     private const string NegotiateScheme = "Negotiate";
     private const int MaxRedirects = 15;
@@ -66,15 +85,34 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
 
         using var httpClient = httpClientFactory.CreateDesktopSsoClient(sessionCookies, credentials);
 
-        var url = new Uri(oktaDomain, redirect.Href);
+        var result = await FollowChainAsync(httpClient, credentials, oktaDomain, HtmlNavigation.Get(new Uri(oktaDomain, redirect.Href)), cancellationToken);
+
+        if (result.NegotiateChallengeSeen)
+            return result;
+
+        // the identity provider redirect did not lead to a Kerberos challenge (Okta served a page instead): use the
+        // documented direct Desktop SSO endpoint, which is what the Okta hosted sign-in page routes browsers through
+        logger.LogWarning("Desktop SSO: the identity provider redirect settled at {Url} (HTTP {StatusCode}) without a Kerberos challenge, trying {Endpoint} directly",
+            result.FinalUrl, (int)result.StatusCode, DirectEndpointPath);
+
+        console.MarkupLine("Okta did not ask for a Kerberos ticket on the identity provider redirect, trying the Desktop SSO endpoint directly...");
+
+        return await FollowChainAsync(httpClient, credentials, oktaDomain, HtmlNavigation.Get(new Uri(oktaDomain, DirectEndpointPath)), cancellationToken);
+    }
+
+    private async Task<AgentlessDssoResult> FollowChainAsync(HttpClient httpClient, CredentialCache credentials, Uri oktaDomain, HtmlNavigation navigation,
+        CancellationToken cancellationToken)
+    {
         string? kerberosHost = null;
         var negotiateChallengeSeen = false;
 
         for (var hop = 0; hop <= MaxRedirects; hop++)
         {
+            var url = navigation.Url;
+
             PrepareCredentials(credentials, url, oktaDomain);
 
-            using var response = await SendAsync(httpClient, url, hop, cancellationToken);
+            using var response = await SendAsync(httpClient, navigation, hop, cancellationToken);
 
             // .NET answers the 401 Negotiate internally, so a challenge shows up either as a lingering 401 (rejected) or as
             // the WWW-Authenticate header echoed on the final response; either way it proves Okta asked for the Kerberos ticket
@@ -86,21 +124,21 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
 
             if (GetRedirectLocation(response, url) is { } location)
             {
-                url = location;
+                navigation = HtmlNavigation.Get(location);
 
                 continue;
             }
 
             var content = await response.Content.ReadAsStringAsync(cancellationToken);
 
-            LogFinalResponse(hop, url, response, content);
+            LogSettledResponse(hop, url, response, content);
 
-            // Okta serves the agentless DSSO step as a 200 HTML page that bounces to the Kerberos challenge URL via
-            // meta-refresh / script; a browser follows it, so must we (otherwise Kerberos is never actually attempted)
-            if (GetHtmlRedirect(response, content, url, oktaDomain) is { } htmlRedirect)
+            // Okta interstitial pages bounce to the next step client side (meta-refresh, script, auto-submitted form);
+            // a browser follows them, so must we (otherwise Kerberos is never actually attempted)
+            if (GetHtmlNavigation(response, content, url, oktaDomain) is { } htmlNavigation)
             {
-                logger.LogDebug("Desktop SSO hop {Hop}: following in-page redirect to {Url}", hop, htmlRedirect);
-                url = htmlRedirect;
+                logger.LogDebug("Desktop SSO hop {Hop}: following in-page navigation {Method} {Url}", hop, htmlNavigation.Method, htmlNavigation.Url);
+                navigation = htmlNavigation;
 
                 continue;
             }
@@ -111,7 +149,7 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
             return new AgentlessDssoResult(url, response.StatusCode, content, kerberosHost, negotiateChallengeSeen);
         }
 
-        throw new OktaFastPassException($"Desktop Single Sign-on did not complete: Okta kept redirecting (more than {MaxRedirects} redirects), last URL: {url}");
+        throw new OktaFastPassException($"Desktop Single Sign-on did not complete: Okta kept redirecting (more than {MaxRedirects} redirects), last URL: {navigation.Url}");
     }
 
     private void PrepareCredentials(CredentialCache credentials, Uri url, Uri oktaDomain)
@@ -130,17 +168,22 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
         return location.IsAbsoluteUri ? location : new Uri(currentUrl, location);
     }
 
-    private static Uri? GetHtmlRedirect(HttpResponseMessage response, string content, Uri currentUrl, Uri oktaDomain)
+    private static HtmlNavigation? GetHtmlNavigation(HttpResponseMessage response, string content, Uri currentUrl, Uri oktaDomain)
     {
         if (response.StatusCode != HttpStatusCode.OK)
             return null;
 
-        return ExtractHtmlRedirect(content, currentUrl) is { } htmlRedirect && IsTrustedOktaHost(htmlRedirect, oktaDomain) ? htmlRedirect : null;
+        return ExtractHtmlNavigation(content, currentUrl) is { } navigation && IsTrustedOktaHost(navigation.Url, oktaDomain) ? navigation : null;
     }
 
-    private async Task<HttpResponseMessage> SendAsync(HttpClient httpClient, Uri url, int hop, CancellationToken cancellationToken)
+    private async Task<HttpResponseMessage> SendAsync(HttpClient httpClient, HtmlNavigation navigation, int hop, CancellationToken cancellationToken)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        var url = navigation.Url;
+
+        using var request = new HttpRequestMessage(navigation.Method, url);
+
+        if (navigation.Method == HttpMethod.Post)
+            request.Content = new FormUrlEncodedContent(navigation.FormFields);
 
         // the Kerberos SPN Okta registers is HTTP/{org}.kerberos.okta.com; with an explicit Host header .NET builds the SPN
         // from it instead of canonicalising the host through DNS (which would follow the CNAME and produce the wrong SPN)
@@ -157,8 +200,9 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
                 ? string.Join(", ", response.Headers.WwwAuthenticate.Select(h => h.Scheme))
                 : "none";
 
-            logger.LogDebug("Desktop SSO hop {Hop}: GET {Url} -> {StatusCode} (WWW-Authenticate: {WwwAuthenticate}, Location: {Location}, Content-Type: {ContentType})",
-                hop, url, (int)response.StatusCode, wwwAuthenticate, response.Headers.Location?.ToString() ?? "none", response.Content.Headers.ContentType?.ToString() ?? "none");
+            logger.LogDebug("Desktop SSO hop {Hop}: {Method} {Url} -> {StatusCode} (WWW-Authenticate: {WwwAuthenticate}, Location: {Location}, Content-Type: {ContentType})",
+                hop, navigation.Method, url, (int)response.StatusCode, wwwAuthenticate, response.Headers.Location?.ToString() ?? "none",
+                response.Content.Headers.ContentType?.ToString() ?? "none");
 
             return response;
         }
@@ -172,22 +216,35 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
         }
     }
 
-    private void LogFinalResponse(int hop, Uri url, HttpResponseMessage response, string content)
+    private void LogSettledResponse(int hop, Uri url, HttpResponseMessage response, string content)
     {
         if (!logger.IsEnabled(LogLevel.Debug))
             return;
 
+        var title = TitleRegex().Match(content) is { Success: true } match ? WebUtility.HtmlDecode(match.Groups["title"].Value).Trim() : "none";
         var snippet = content.Length > LoggedBodySnippetLength ? content[..LoggedBodySnippetLength] + "..." : content;
 
-        logger.LogDebug("Desktop SSO hop {Hop}: {Url} settled at HTTP {StatusCode} ({Length} bytes). Body: {Body}",
-            hop, url, (int)response.StatusCode, content.Length, snippet);
+        logger.LogDebug("Desktop SSO hop {Hop}: {Url} settled at HTTP {StatusCode} ({Length} bytes, title: {Title}). Body: {Body}",
+            hop, url, (int)response.StatusCode, content.Length, title, snippet);
+
+        try
+        {
+            var path = AppDataDirectory.GetPath(CapturedPageFileName);
+            File.WriteAllText(path, $"<!-- {url} -> HTTP {(int)response.StatusCode} -->\n{content}");
+
+            logger.LogDebug("Desktop SSO hop {Hop}: full page saved to {Path}", hop, path);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            logger.LogDebug(e, "Desktop SSO: could not save the page for diagnostics");
+        }
     }
 
     /// <summary>
-    ///     Finds the URL an HTML page bounces to without a real HTTP redirect: meta-refresh or a plain
-    ///     <c>window.location = '...'</c> / <c>location.replace('...')</c> assignment
+    ///     Finds the navigation an HTML page performs on its own: meta-refresh, a <c>location</c> assignment in a script
+    ///     or an auto-submitted form (Okta interstitial pages post a hidden form to the next step)
     /// </summary>
-    public static Uri? ExtractHtmlRedirect(string html, Uri baseUrl)
+    public static HtmlNavigation? ExtractHtmlNavigation(string html, Uri baseUrl)
     {
         if (string.IsNullOrWhiteSpace(html))
             return null;
@@ -197,21 +254,66 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
         if (!match.Success)
             match = JsLocationRegex().Match(html);
 
-        if (!match.Success)
-            return null;
+        if (match.Success)
+        {
+            var target = WebUtility.HtmlDecode(match.Groups["url"].Value).Trim();
 
-        var target = WebUtility.HtmlDecode(match.Groups["url"].Value).Trim();
+            return Uri.TryCreate(baseUrl, target, out var uri) ? HtmlNavigation.Get(uri) : null;
+        }
 
-        return Uri.TryCreate(baseUrl, target, out var uri) ? uri : null;
+        return ExtractAutoSubmittedForm(html, baseUrl);
     }
 
-    [GeneratedRegex("""<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["'][^"']*url\s*=\s*(?<url>[^"']+)["']""",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex MetaRefreshRegex();
+    /// <summary>
+    ///     Kept for callers that only need the target URL of a client side redirect
+    /// </summary>
+    public static Uri? ExtractHtmlRedirect(string html, Uri baseUrl) => ExtractHtmlNavigation(html, baseUrl)?.Url;
 
-    [GeneratedRegex("""(?:window\.)?location(?:\.href)?\s*=\s*["'](?<url>[^"']+)["']|location\.replace\(\s*["'](?<url>[^"']+)["']""",
-        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
-    private static partial Regex JsLocationRegex();
+    private static HtmlNavigation? ExtractAutoSubmittedForm(string html, Uri baseUrl)
+    {
+        // only forms the page submits by itself (script calling submit()) are followed, never forms waiting for user input
+        if (!FormSubmitScriptRegex().IsMatch(html))
+            return null;
+
+        var form = FormRegex().Match(html);
+
+        if (!form.Success)
+            return null;
+
+        var attributes = form.Groups["attributes"].Value;
+        var action = AttributeValue(attributes, "action");
+
+        if (action is null || !Uri.TryCreate(baseUrl, WebUtility.HtmlDecode(action), out var url))
+            return null;
+
+        var method = string.Equals(AttributeValue(attributes, "method"), "post", StringComparison.OrdinalIgnoreCase) ? HttpMethod.Post : HttpMethod.Get;
+
+        var fields = new Dictionary<string, string>();
+
+        foreach (Match input in InputRegex().Matches(form.Groups["body"].Value))
+        {
+            var inputAttributes = input.Groups["attributes"].Value;
+
+            if (AttributeValue(inputAttributes, "name") is { } name)
+                fields[WebUtility.HtmlDecode(name)] = WebUtility.HtmlDecode(AttributeValue(inputAttributes, "value") ?? string.Empty);
+        }
+
+        if (method == HttpMethod.Get && fields.Count > 0)
+        {
+            var query = string.Join('&', fields.Select(f => $"{Uri.EscapeDataString(f.Key)}={Uri.EscapeDataString(f.Value)}"));
+            url = new Uri(url.GetLeftPart(UriPartial.Path) + (url.Query.Length > 0 ? url.Query + "&" : "?") + query);
+        }
+
+        return new HtmlNavigation(url, method, fields);
+    }
+
+    private static string? AttributeValue(string attributes, string name)
+    {
+        var match = Regex.Match(attributes, $"""(?:^|\s){name}\s*=\s*(?:"(?<value>[^"]*)"|'(?<value>[^']*)'|(?<value>[^\s>]+))""",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+
+        return match.Success ? match.Groups["value"].Value : null;
+    }
 
     /// <summary>
     ///     Only Okta's own hosts may challenge for the Kerberos ticket: the org (including custom domains), the org's
@@ -247,4 +349,24 @@ public partial class OktaAgentlessDssoHandler(IOktaIdxHttpClientFactory httpClie
     private static bool IsRedirect(HttpStatusCode statusCode) =>
         statusCode is HttpStatusCode.MovedPermanently or HttpStatusCode.Found or HttpStatusCode.SeeOther
             or HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect;
+
+    [GeneratedRegex("""<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]+content\s*=\s*["'][^"']*url\s*=\s*(?<url>[^"']+)["']""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex MetaRefreshRegex();
+
+    [GeneratedRegex("""(?:window\.|document\.)?location(?:\.href)?\s*=\s*["'](?<url>[^"']+)["']|location\.(?:replace|assign)\(\s*["'](?<url>[^"']+)["']""",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex JsLocationRegex();
+
+    [GeneratedRegex(@"\.submit\s*\(", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex FormSubmitScriptRegex();
+
+    [GeneratedRegex("""<form(?<attributes>[^>]*)>(?<body>.*?)</form>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Singleline)]
+    private static partial Regex FormRegex();
+
+    [GeneratedRegex("""<input(?<attributes>[^>]*)>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex InputRegex();
+
+    [GeneratedRegex("""<title[^>]*>(?<title>.*?)</title>""", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Singleline)]
+    private static partial Regex TitleRegex();
 }

@@ -65,6 +65,21 @@ public sealed class FakeHttpMessageHandler : HttpMessageHandler
     public FakeHttpMessageHandler OnRedirect(HttpMethod method, string url, string location) =>
         On(method, url, _ => Task.FromResult(Redirect(location)));
 
+    /// <summary>
+    ///     Redirect issued after a successful Kerberos handshake: the server echoes the mutual authentication token
+    ///     in WWW-Authenticate (the 401 challenge itself is consumed by the HTTP stack and never reaches the caller)
+    /// </summary>
+    public static HttpResponseMessage KerberosRedirect(string location)
+    {
+        var response = Redirect(location);
+        response.Headers.WwwAuthenticate.Add(new System.Net.Http.Headers.AuthenticationHeaderValue("Negotiate", "oRQwEqADCgEAoQsGCSqGSIb3EgECAg=="));
+
+        return response;
+    }
+
+    public FakeHttpMessageHandler OnKerberosRedirect(HttpMethod method, string url, string location) =>
+        On(method, url, _ => Task.FromResult(KerberosRedirect(location)));
+
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         var body = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
