@@ -3,6 +3,7 @@
 using Ellosoft.AwsCredentialsManager.Services.Configuration;
 using Ellosoft.AwsCredentialsManager.Services.Configuration.Models;
 using Ellosoft.AwsCredentialsManager.Services.Okta;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Browser;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Exceptions;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
@@ -19,6 +20,7 @@ namespace Ellosoft.AwsCredentialsManager.Tests.Services.Okta;
 public class OktaLoginServiceTests
 {
     private const string Profile = "default";
+    private const string OktaAppUrl = "https://xyz.okta.com/home/amazon_aws/abc/272";
     private static readonly Uri OktaDomain = new("https://xyz.okta.com/");
     private static readonly UserCredentials Credentials = new("john@xyz.com", "P@ssw0rd");
 
@@ -26,6 +28,7 @@ public class OktaLoginServiceTests
     private readonly IUserCredentialsManager _userCredentialsManager = Substitute.For<IUserCredentialsManager>();
     private readonly IOktaClassicAuthenticator _classicAuthenticator = Substitute.For<IOktaClassicAuthenticator>();
     private readonly IOktaIdxAuthenticator _idxAuthenticator = Substitute.For<IOktaIdxAuthenticator>();
+    private readonly IOktaBrowserAuthenticator _browserAuthenticator = Substitute.For<IOktaBrowserAuthenticator>();
     private readonly IOktaSessionService _sessionService = Substitute.For<IOktaSessionService>();
     private readonly OktaLoginService _loginService;
 
@@ -34,12 +37,14 @@ public class OktaLoginServiceTests
         _userCredentialsManager.GetUserCredentials(Profile).Returns(Credentials);
 
         _loginService = new OktaLoginService(new TestConsole(), _configManager, _userCredentialsManager, _classicAuthenticator, _idxAuthenticator,
-            _sessionService);
+            _browserAuthenticator, _sessionService);
     }
 
     [Fact]
     public async Task InteractiveLogin_WhenPreferredMfaIsFastPass_ShouldUseIdentityEngineAuthenticator()
     {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "FastPass sign-ins run in the browser on Windows");
+
         ConfigureProfile("fastpass");
 
         var idxResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid", MfaUsed = "signed_nonce" };
@@ -51,6 +56,7 @@ public class OktaLoginServiceTests
 
         await _classicAuthenticator.DidNotReceiveWithAnyArgs().AuthenticateAsync(default!, default!, default!, default);
         await _classicAuthenticator.DidNotReceiveWithAnyArgs().CreateSessionAsync(default!, default!);
+        await _browserAuthenticator.DidNotReceiveWithAnyArgs().AuthenticateAsync(default!, TestContext.Current.CancellationToken);
     }
 
     [Theory]
@@ -124,6 +130,40 @@ public class OktaLoginServiceTests
     }
 
     [Fact]
+    public async Task InteractiveLogin_WithBrowserAuthType_ShouldSignInThroughBrowserForTheApp()
+    {
+        ConfigureProfile("push", authType: OktaConfiguration.BrowserAuthType);
+
+        var browserResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid" };
+        _browserAuthenticator.AuthenticateAsync(Arg.Any<OktaBrowserSignInRequest>(), Arg.Any<CancellationToken>()).Returns(browserResult);
+
+        var result = await _loginService.InteractiveLogin(Profile, oktaAppUrl: OktaAppUrl);
+
+        result.ShouldBe(browserResult);
+
+        await _browserAuthenticator.Received(1).AuthenticateAsync(
+            new OktaBrowserSignInRequest(OktaDomain, OktaAppUrl, Credentials.Username, Credentials.Password, "push"), Arg.Any<CancellationToken>());
+
+        await _classicAuthenticator.DidNotReceiveWithAnyArgs().AuthenticateAsync(default!, default!, default!, default);
+        _sessionService.Received(1).Save(Profile, browserResult);
+    }
+
+    [Fact]
+    public async Task InteractiveLogin_WithBrowserAuthTypeAndNoSavedPassword_ShouldOnlyPreFillUsername()
+    {
+        ConfigureProfile(null, authType: OktaConfiguration.BrowserAuthType);
+        _userCredentialsManager.GetUserCredentials(Profile).Returns(Credentials with { Password = string.Empty });
+
+        _browserAuthenticator.AuthenticateAsync(Arg.Any<OktaBrowserSignInRequest>(), Arg.Any<CancellationToken>())
+            .Returns(new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid" });
+
+        await _loginService.InteractiveLogin(Profile);
+
+        await _browserAuthenticator.Received(1).AuthenticateAsync(
+            new OktaBrowserSignInRequest(OktaDomain, null, Credentials.Username, null, null), Arg.Any<CancellationToken>());
+    }
+
+    [Fact]
     public async Task ResumeSessionAsync_ShouldReturnSavedSession()
     {
         ConfigureProfile("push");
@@ -159,8 +199,29 @@ public class OktaLoginServiceTests
     }
 
     [Fact]
+    public async Task Login_WithBrowserAuthType_ShouldSaveUsernameWithoutPassword()
+    {
+        _userCredentialsManager.SupportCredentialsStore.Returns(true);
+
+        var browserResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid" };
+        _browserAuthenticator.AuthenticateAsync(Arg.Any<OktaBrowserSignInRequest>(), Arg.Any<CancellationToken>()).Returns(browserResult);
+
+        var result = await _loginService.Login(OktaDomain, Credentials with { Password = string.Empty }, "push", savedCredentials: false, Profile,
+            OktaConfiguration.BrowserAuthType);
+
+        result.ShouldBe(browserResult);
+
+        await _browserAuthenticator.Received(1).AuthenticateAsync(
+            new OktaBrowserSignInRequest(OktaDomain, null, Credentials.Username, null, "push"), Arg.Any<CancellationToken>());
+
+        _userCredentialsManager.Received(1).SaveUserCredentials(Profile, new UserCredentials(Credentials.Username, string.Empty));
+    }
+
+    [Fact]
     public async Task Login_WhenFastPassAuthenticatorRejectsCredentials_ShouldClearStoredPasswordAndReturnUnauthenticated()
     {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "FastPass sign-ins run in the browser on Windows");
+
         _idxAuthenticator.AuthenticateAsync(OktaDomain, Credentials.Username, Credentials.Password, Arg.Any<CancellationToken>())
             .ThrowsAsync(new InvalidUsernameOrPasswordException());
 
@@ -170,7 +231,7 @@ public class OktaLoginServiceTests
         _userCredentialsManager.Received(1).SaveUserCredentials(Profile, Arg.Is<UserCredentials>(c => c.Username == Credentials.Username && c.Password == string.Empty));
     }
 
-    private void ConfigureProfile(string? preferredMfa, bool? rememberSession = null)
+    private void ConfigureProfile(string? preferredMfa, string authType = OktaConfiguration.ClassicAuthType, bool? rememberSession = null)
     {
         var config = new AppConfig
         {
@@ -178,7 +239,13 @@ public class OktaLoginServiceTests
             {
                 Okta = new Dictionary<string, OktaConfiguration>
                 {
-                    [Profile] = new() { OktaDomain = OktaDomain.ToString(), PreferredMfaType = preferredMfa, RememberSession = rememberSession }
+                    [Profile] = new()
+                    {
+                        OktaDomain = OktaDomain.ToString(),
+                        PreferredMfaType = preferredMfa,
+                        AuthType = authType,
+                        RememberSession = rememberSession
+                    }
                 }
             }
         };

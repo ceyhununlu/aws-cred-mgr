@@ -14,7 +14,7 @@ public interface IOktaSamlService
 {
     /// <summary>
     ///     Retrieves the SAML assertion for an Okta app using the session carried by the authentication result
-    ///     (session cookies or session id for Identity Engine / FastPass authentication, session token for classic authentication)
+    ///     (session cookies or session id for Identity Engine / FastPass / browser authentication, session token for classic authentication)
     /// </summary>
     /// <exception cref="OktaAppReauthenticationRequiredException">Okta requires the user to sign in again to access the app</exception>
     Task<SamlData> GetAppSamlDataAsync(AuthenticationResult authenticationResult, string oktaAppUrl);
@@ -28,6 +28,9 @@ public class OktaSamlService(Func<HttpMessageHandler> httpMessageHandlerFactory)
 
     public async Task<SamlData> GetAppSamlDataAsync(AuthenticationResult authenticationResult, string oktaAppUrl)
     {
+        if (authenticationResult.CapturedSaml is { } capturedSaml && IsSameApp(capturedSaml.OktaAppUrl, oktaAppUrl))
+            return capturedSaml.SamlData;
+
         using var response = await GetAppPageAsync(authenticationResult, oktaAppUrl);
 
         if (!response.IsSuccessStatusCode)
@@ -53,6 +56,9 @@ public class OktaSamlService(Func<HttpMessageHandler> httpMessageHandlerFactory)
             RelayState: document.QuerySelector("input[name=RelayState]")?.GetAttribute("value") ?? String.Empty
         );
     }
+
+    private static bool IsSameApp(string capturedAppUrl, string oktaAppUrl) =>
+        string.Equals(capturedAppUrl.TrimEnd('/'), oktaAppUrl.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
 
     private static InvalidOperationException CreateMissingSamlAssertionException(string responseBody, HttpResponseMessage response)
     {

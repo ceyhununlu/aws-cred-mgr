@@ -117,6 +117,8 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
 
     private (string Domain, string Username, string Password) RunOktaSetupWithFastPass()
     {
+        Assert.SkipWhen(OperatingSystem.IsWindows(), "FastPass sign-ins run in the browser on Windows");
+
         App.Configure(config =>
             config.AddBranch<OktaBranch>(okta =>
                 okta.AddCommand<SetupOkta>()));

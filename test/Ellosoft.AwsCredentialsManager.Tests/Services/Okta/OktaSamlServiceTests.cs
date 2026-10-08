@@ -112,6 +112,45 @@ public class OktaSamlServiceTests
         _handler.RequestsTo(HttpMethod.Get, OktaAppUrl).ShouldHaveSingleItem().Request.Headers.UserAgent.ToString().ShouldBe(USER_AGENT);
     }
 
+    [Theory]
+    [InlineData(OktaAppUrl)]
+    [InlineData("https://XYZ.okta.com/home/amazon_aws/abc/272/")]
+    public async Task GetAppSamlDataAsync_WithSamlCapturedByBrowserSignIn_ShouldReturnItWithoutCallingOkta(string capturedAppUrl)
+    {
+        var capturedSaml = new SamlData("captured-assertion", "https://signin.aws.amazon.com/saml", "relay");
+
+        var authResult = new AuthenticationResult
+        {
+            OktaDomain = OktaDomain,
+            Authenticated = true,
+            CapturedSaml = new CapturedSamlResponse(capturedAppUrl, capturedSaml)
+        };
+
+        var samlData = await _samlService.GetAppSamlDataAsync(authResult, OktaAppUrl);
+
+        samlData.ShouldBe(capturedSaml);
+        _handler.Requests.ShouldBeEmpty();
+    }
+
+    [Fact]
+    public async Task GetAppSamlDataAsync_WithSamlCapturedForAnotherApp_ShouldRequestTheAppFromOkta()
+    {
+        _handler.On(HttpMethod.Get, OktaAppUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(SamlPage)));
+
+        var authResult = new AuthenticationResult
+        {
+            OktaDomain = OktaDomain,
+            Authenticated = true,
+            SessionId = "102sid",
+            CapturedSaml = new CapturedSamlResponse("https://xyz.okta.com/home/amazon_aws/other/272",
+                new SamlData("other-assertion", "https://signin.aws.amazon.com/saml", string.Empty))
+        };
+
+        var samlData = await _samlService.GetAppSamlDataAsync(authResult, OktaAppUrl);
+
+        samlData.SamlAssertion.ShouldBe("c2FtbC1hc3NlcnRpb24=");
+    }
+
     [Fact]
     public async Task GetAppSamlDataAsync_WhenOktaReturnsSignInPageInsteadOfSaml_ShouldExplainAdditionalVerification()
     {

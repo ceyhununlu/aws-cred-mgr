@@ -7,6 +7,7 @@ using Ellosoft.AwsCredentialsManager.Services.Configuration;
 using Ellosoft.AwsCredentialsManager.Services.Configuration.Interactive;
 using Ellosoft.AwsCredentialsManager.Services.IO;
 using Ellosoft.AwsCredentialsManager.Services.Okta;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Browser;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Sessions;
@@ -47,8 +48,10 @@ public static class ServiceRegistration
             .AddSingleton<IOktaFastPassChallengeHandler, OktaFastPassChallengeHandler>()
             .AddSingleton<IOktaIdxAuthenticator, OktaIdxAuthenticator>();
 
-        // okta session reuse services
+        // okta browser sign-in and session reuse services
         services
+            .AddSingleton<IBrowserLocator, BrowserLocator>()
+            .AddSingleton<IOktaBrowserAuthenticator, OktaBrowserAuthenticator>()
             .AddSingleton<IOktaSessionStore, OktaSessionStore>()
             .AddSingleton<IOktaSessionClient, OktaSessionClient>()
             .AddSingleton<IOktaSessionService, OktaSessionService>();

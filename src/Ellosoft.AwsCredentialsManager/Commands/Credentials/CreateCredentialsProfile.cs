@@ -128,7 +128,7 @@ public class CreateCredentialsProfile(
 
         if (samlData is null)
         {
-            var authenticationResult = await oktaLogin.InteractiveLogin(oktaUserProfile);
+            var authenticationResult = await oktaLogin.InteractiveLogin(oktaUserProfile, oktaAppUrl: oktaAppUrl);
 
             if (authenticationResult is not { HasSession: true })
                 throw new CommandException("Unable to create AWS credential profile, please try again");

@@ -2,6 +2,7 @@
 
 using Ellosoft.AwsCredentialsManager.Services.Configuration;
 using Ellosoft.AwsCredentialsManager.Services.Configuration.Models;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Browser;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
 
 namespace Ellosoft.AwsCredentialsManager.Commands.Okta;
@@ -12,7 +13,8 @@ namespace Ellosoft.AwsCredentialsManager.Commands.Okta;
     "setup",
     "setup -d https://xyz.okta.com -u john --mfa push",
     "setup xyz_profile -d https://xyz.okta.com -u john --mfa push",
-    "setup -d https://xyz.okta.com -u john --mfa fastpass")]
+    "setup -d https://xyz.okta.com -u john --mfa fastpass",
+    "setup -d https://xyz.okta.com -u john --browser")]
 public class SetupOkta(IOktaLoginService loginService, IConfigManager configManager) : AsyncCommand<SetupOkta.Settings>
 {
     public class Settings : CommonSettings
@@ -31,8 +33,13 @@ public class SetupOkta(IOktaLoginService loginService, IConfigManager configMana
         public string? Username { get; set; }
 
         [CommandOption("--mfa")]
-        [Description("Your preferred MFA type <push|totp|code|fastpass> (fastpass uses the Okta Verify desktop app and requires Okta Identity Engine)")]
+        [Description("Your preferred MFA type <push|totp|code|fastpass> (fastpass uses the Okta Verify desktop app and requires Okta Identity Engine, " +
+                     "on Windows it signs in through the browser)")]
         public string? PreferredMfaType { get; set; }
+
+        [CommandOption("--browser")]
+        [Description("Sign in to Okta in a browser window (Microsoft Edge or Google Chrome), Okta asks for MFA in the browser")]
+        public bool Browser { get; set; }
     }
 
     protected override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
@@ -41,19 +48,24 @@ public class SetupOkta(IOktaLoginService loginService, IConfigManager configMana
 
         var oktaDomain = GetOktaDomainUrl(settings);
         var username = settings.Username ?? await AnsiConsole.AskAsync<string>("Enter your [green]Okta[/] username:", cancellationToken);
-        var password = await AnsiConsole.PromptAsync(new TextPrompt<string>("Enter your [green]Okta[/] password:").Secret(), cancellationToken);
+        var preferredMfaType = settings.PreferredMfaType is not null ? OktaMfaFactorSelector.GetOktaMfaFactorCode(settings.PreferredMfaType) : null;
+        var authType = settings.Browser ? OktaConfiguration.BrowserAuthType : OktaConfiguration.ClassicAuthType;
+
+        // the password is typed on the Okta page when signing in through the browser
+        var password = OktaBrowserSignIn.IsRequired(preferredMfaType, authType)
+            ? string.Empty
+            : await AnsiConsole.PromptAsync(new TextPrompt<string>("Enter your [green]Okta[/] password:").Secret(), cancellationToken);
 
         AnsiConsole.WriteLine();
 
         var credentials = new UserCredentials(username, password);
-        var preferredMfaType = settings.PreferredMfaType is not null ? OktaMfaFactorSelector.GetOktaMfaFactorCode(settings.PreferredMfaType) : null;
 
-        var authResult = await loginService.Login(oktaDomain, credentials, preferredMfaType, userProfileKey: settings.Profile);
+        var authResult = await loginService.Login(oktaDomain, credentials, preferredMfaType, userProfileKey: settings.Profile, authType: authType);
 
         if (!authResult.Authenticated)
             throw new CommandException("Unable to create profile, please try again");
 
-        CreateOktaProfile(settings.Profile, oktaDomain.ToString(), authResult.MfaUsed);
+        CreateOktaProfile(settings.Profile, oktaDomain.ToString(), authResult.MfaUsed, authType);
 
         await loginService.SaveSessionAsync(settings.Profile, authResult);
 
@@ -80,7 +92,7 @@ public class SetupOkta(IOktaLoginService loginService, IConfigManager configMana
         return new Uri(oktaDomain);
     }
 
-    private void CreateOktaProfile(string profileName, string oktaDomain, string? preferredMfaType)
+    private void CreateOktaProfile(string profileName, string oktaDomain, string? preferredMfaType, string authType)
     {
         var appConfig = configManager.AppConfig;
         appConfig.Authentication ??= new AppConfig.AuthenticationSection();
@@ -88,7 +100,8 @@ public class SetupOkta(IOktaLoginService loginService, IConfigManager configMana
         appConfig.Authentication.Okta[profileName] = new OktaConfiguration
         {
             OktaDomain = oktaDomain,
-            PreferredMfaType = preferredMfaType
+            PreferredMfaType = preferredMfaType,
+            AuthType = authType
         };
 
         configManager.SaveConfig();

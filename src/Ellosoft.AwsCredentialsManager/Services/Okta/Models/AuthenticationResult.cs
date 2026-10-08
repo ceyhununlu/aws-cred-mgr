@@ -28,6 +28,11 @@ public record AuthenticationResult
     public string? UserAgent { get; init; }
 
     /// <summary>
+    ///     SAML response captured while signing in through the browser (the browser posts it to AWS straight after the sign-in)
+    /// </summary>
+    public CapturedSamlResponse? CapturedSaml { get; init; }
+
+    /// <summary>
     ///     True when the session was restored from the secure storage instead of being created by a new sign-in
     /// </summary>
     public bool IsResumedSession { get; init; }
@@ -36,8 +41,12 @@ public record AuthenticationResult
 
     /// <summary>
     ///     True when the result carries an Okta session: a session token (classic authentication),
-    ///     a session id or session cookies (Identity Engine / FastPass authentication, where the session cookie is the session)
+    ///     a session id or session cookies (Identity Engine / FastPass / browser sign-in, where the session cookie is the session)
     /// </summary>
-    public bool HasSession => Authenticated && (SessionToken is not null || SessionId is not null || SessionCookies is not null);
+    public bool HasSession => Authenticated && (SessionToken is not null || SessionId is not null || SessionCookies is not null || CapturedSaml is not null);
 }
 
+/// <summary>
+///     SAML response posted to AWS for the Okta app at <paramref name="OktaAppUrl" />
+/// </summary>
+public record CapturedSamlResponse(string OktaAppUrl, SamlData SamlData);

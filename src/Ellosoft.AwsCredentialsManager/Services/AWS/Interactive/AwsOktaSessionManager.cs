@@ -108,7 +108,7 @@ public class AwsOktaSessionManager(
 
     private async Task<SamlData?> GetSamlDataWithNewOktaSessionAsync(string oktaProfile, string oktaAppUrl)
     {
-        var authResult = await loginService.InteractiveLogin(oktaProfile);
+        var authResult = await loginService.InteractiveLogin(oktaProfile, oktaAppUrl: oktaAppUrl);
 
         if (authResult is not { HasSession: true })
             return null;

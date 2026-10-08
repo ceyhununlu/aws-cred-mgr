@@ -56,21 +56,29 @@ public sealed class ConfigReaderTests : IDisposable
     }
 
     [Fact]
-    public void Read_ConfigWithSessionSettings_ShouldParseSessionSettings()
+    public void Read_ConfigWithSessionSettings_ShouldParseSessionAndBrowserSettings()
     {
         var yaml = """
                    authentication:
                      okta:
                        default:
                          okta_domain: https://test.okta.com/
+                         auth_type: browser
                          remember_session: false
+
+                   config:
+                     browser_path: C:\Program Files\Google\Chrome\Application\chrome.exe
                    """;
 
         var filePath = CreateTempFile(yaml);
 
         var config = _configReader.Read(filePath);
 
-        config.Authentication.ShouldNotBeNull().Okta["default"].RememberSession.ShouldBe(false);
+        var oktaProfile = config.Authentication.ShouldNotBeNull().Okta["default"];
+        oktaProfile.AuthType.ShouldBe("browser");
+        oktaProfile.RememberSession.ShouldBe(false);
+
+        config.Config.ShouldNotBeNull().BrowserPath.ShouldBe(@"C:\Program Files\Google\Chrome\Application\chrome.exe");
     }
 
     [Fact]

@@ -74,7 +74,7 @@ public class AwsOktaSessionManagerTests
         result.ShouldNotBeNull();
         result.ShouldBeOfType<SessionAWSCredentials>();
         await _loginService.DidNotReceiveWithAnyArgs().ResumeSessionAsync(default!);
-        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default);
+        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default, default);
         await _awsCredentialsService.DidNotReceive().GetAwsCredentials(
             Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<int>());
     }
@@ -92,7 +92,7 @@ public class AwsOktaSessionManagerTests
             SessionToken = "session-token"
         };
 
-        _loginService.InteractiveLogin(OktaProfile).Returns(authResult);
+        _loginService.InteractiveLogin(OktaProfile, false, OktaAppUrl).Returns(authResult);
         _oktaSamlService.GetAppSamlDataAsync(authResult, OktaAppUrl).Returns(SamlData);
 
         var freshCredentials = CreateFreshCredentials();
@@ -103,7 +103,7 @@ public class AwsOktaSessionManagerTests
         var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile, forceRenew: true);
 
         result.ShouldNotBeNull();
-        await _loginService.Received(1).InteractiveLogin(OktaProfile);
+        await _loginService.Received(1).InteractiveLogin(OktaProfile, false, OktaAppUrl);
         await _awsCredentialsService.Received(1).GetAwsCredentials("saml-assertion", RoleArn, IdpArn);
         _awsCredentialsService.Received(1).StoreCredentials(AwsProfile, freshCredentials);
     }
@@ -122,7 +122,7 @@ public class AwsOktaSessionManagerTests
             MfaUsed = "signed_nonce"
         };
 
-        _loginService.InteractiveLogin(OktaProfile).Returns(authResult);
+        _loginService.InteractiveLogin(OktaProfile, false, OktaAppUrl).Returns(authResult);
         _oktaSamlService.GetAppSamlDataAsync(authResult, OktaAppUrl).Returns(SamlData);
 
         _awsCredentialsService.GetAwsCredentials("saml-assertion", RoleArn, IdpArn)
@@ -139,7 +139,7 @@ public class AwsOktaSessionManagerTests
     {
         _awsCredentialsService.GetCredentialsFromStore(AwsProfile).Returns((AwsCredentialsData?)null);
 
-        _loginService.InteractiveLogin(OktaProfile).Returns(new AuthenticationResult
+        _loginService.InteractiveLogin(OktaProfile, false, OktaAppUrl).Returns(new AuthenticationResult
         {
             OktaDomain = new Uri("https://xyz.okta.com/"),
             Authenticated = false
@@ -167,7 +167,7 @@ public class AwsOktaSessionManagerTests
         var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile);
 
         (await result.ShouldBeOfType<SessionAWSCredentials>().GetCredentialsAsync()).AccessKey.ShouldBe("NEW_KEY");
-        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default);
+        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default, default);
         await _loginService.Received(1).SaveSessionAsync(OktaProfile, savedSession);
         _awsCredentialsService.Received(1).StoreCredentials(AwsProfile, freshCredentials);
     }
@@ -185,7 +185,7 @@ public class AwsOktaSessionManagerTests
         var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile);
 
         result.ShouldNotBeNull();
-        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default);
+        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default, default);
     }
 
     [Fact]
@@ -199,14 +199,14 @@ public class AwsOktaSessionManagerTests
             .ThrowsAsync(new OktaAppReauthenticationRequiredException("Okta requires additional verification"));
 
         var newSession = new AuthenticationResult { OktaDomain = new Uri("https://xyz.okta.com/"), Authenticated = true, SessionId = "102new" };
-        _loginService.InteractiveLogin(OktaProfile).Returns(newSession);
+        _loginService.InteractiveLogin(OktaProfile, false, OktaAppUrl).Returns(newSession);
         _oktaSamlService.GetAppSamlDataAsync(newSession, OktaAppUrl).Returns(SamlData);
         _awsCredentialsService.GetAwsCredentials("saml-assertion", RoleArn, IdpArn).Returns(CreateFreshCredentials());
 
         var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile);
 
         result.ShouldNotBeNull();
-        await _loginService.Received(1).InteractiveLogin(OktaProfile);
+        await _loginService.Received(1).InteractiveLogin(OktaProfile, false, OktaAppUrl);
         await _loginService.DidNotReceiveWithAnyArgs().SaveSessionAsync(default!, default!);
     }
 
@@ -223,7 +223,7 @@ public class AwsOktaSessionManagerTests
         var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile, forceRenew: true);
 
         (await result.ShouldBeOfType<SessionAWSCredentials>().GetCredentialsAsync()).AccessKey.ShouldBe("NEW_KEY");
-        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default);
+        await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default, default);
     }
 
     private static AuthenticationResult CreateSavedSession() =>

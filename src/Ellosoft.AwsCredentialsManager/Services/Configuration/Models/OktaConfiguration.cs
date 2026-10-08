@@ -6,6 +6,13 @@ public class OktaConfiguration : ResourceConfiguration
 {
     public const string DefaultProfileName = "default";
 
+    public const string ClassicAuthType = "classic";
+
+    /// <summary>
+    ///     Sign in to Okta through a browser window (Microsoft Edge or Google Chrome)
+    /// </summary>
+    public const string BrowserAuthType = "browser";
+
     public required string OktaDomain { get; set; }
 
     /// <summary>
@@ -13,7 +20,7 @@ public class OktaConfiguration : ResourceConfiguration
     /// </summary>
     public string? PreferredMfaType { get; set; }
 
-    public string AuthType { get; set; } = "classic";
+    public string AuthType { get; set; } = ClassicAuthType;
 
     /// <summary>
     ///     Save the Okta session in the secure storage (macOS Keychain / Windows DPAPI) and reuse it to renew AWS credentials
