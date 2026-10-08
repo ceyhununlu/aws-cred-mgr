@@ -8,6 +8,8 @@ using Ellosoft.AwsCredentialsManager.Services.Configuration;
 using Ellosoft.AwsCredentialsManager.Services.Configuration.Models;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Models;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Sessions;
 using Ellosoft.AwsCredentialsManager.Services.Security;
 using Ellosoft.AwsCredentialsManager.Tests.Integration.FakeApis;
 using Ellosoft.AwsCredentialsManager.Tests.Integration.Utils;
@@ -22,6 +24,7 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
 {
     private readonly string _profileName = Guid.NewGuid().ToString("N");
     private readonly IConfigManager _configManager = Substitute.For<IConfigManager>();
+    private readonly IOktaSessionService _sessionService = Substitute.For<IOktaSessionService>();
 
     public OktaSetupFastPassTests(ITestOutputHelper outputHelper, TestFixture testFixture) : base(outputHelper, testFixture)
     {
@@ -34,6 +37,7 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
         // keep the test hermetic (no real config file / keychain) and route the IDX + loopback traffic to the fake Okta API
         AppServices.Replace(ServiceDescriptor.Singleton(_configManager));
         AppServices.Replace(ServiceDescriptor.Singleton(userCredentialsManager));
+        AppServices.Replace(ServiceDescriptor.Singleton(_sessionService));
         AppServices.Replace(ServiceDescriptor.Singleton<IOktaIdxHttpClientFactory>(
             new TestOktaIdxHttpClientFactory(TestFixture.WebApp.GetTestServer(), TestCorrelationId)));
     }
@@ -139,6 +143,8 @@ public sealed class OktaSetupFastPassTests : IntegrationTest
         oktaProfile.OktaDomain.ShouldBe($"{domain}/");
         oktaProfile.PreferredMfaType.ShouldBe(OktaMfaFactorSelector.FastPassFactorCode);
         _configManager.Received(1).SaveConfig();
+
+        _sessionService.Received(1).Save(_profileName, Arg.Is<AuthenticationResult>(r => r.SessionId == OktaIdxController.SessionId));
     }
 
     /// <summary>

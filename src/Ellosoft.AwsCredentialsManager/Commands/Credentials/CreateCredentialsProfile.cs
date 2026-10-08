@@ -71,9 +71,10 @@ public class CreateCredentialsProfile(
     {
         AnsiConsole.MarkupLine("Retrieving AWS Apps from OKTA...");
 
-        var authenticationResult = await oktaLogin.InteractiveLogin(oktaUserProfile, createSession: true);
+        var authenticationResult = await oktaLogin.ResumeSessionAsync(oktaUserProfile)
+                                   ?? await oktaLogin.InteractiveLogin(oktaUserProfile, createSession: true);
 
-        if (authenticationResult?.SessionId is null)
+        if (authenticationResult is null || (authenticationResult.SessionId is null && authenticationResult.SessionCookies is null))
             throw new CommandException("Unable to retrieve OKTA apps, please try again or use the '--okta-app-url' option to specify an app URL manually");
 
         var awsAppLinks = await GetAwsLinks(authenticationResult);
@@ -99,10 +100,13 @@ public class CreateCredentialsProfile(
         // TODO: Replace with HttpClientFactory client
         using var httpClient = new HttpClient();
 
-        var request = new HttpRequestMessage(HttpMethod.Get, appLinksUrl);
+        using var request = new HttpRequestMessage(HttpMethod.Get, appLinksUrl);
 
         // Identity Engine (FastPass) sessions are carried by several cookies, classic sessions by the session id only
         request.Headers.Add("Cookie", authenticationResult.SessionCookies?.GetCookieHeader(appLinksUrl) ?? $"sid={authenticationResult.SessionId}");
+
+        if (authenticationResult.UserAgent is not null)
+            request.Headers.TryAddWithoutValidation("User-Agent", authenticationResult.UserAgent);
 
         var httpResponse = await httpClient.SendAsync(request);
         httpResponse.EnsureSuccessStatusCode();
@@ -120,12 +124,17 @@ public class CreateCredentialsProfile(
     {
         AnsiConsole.MarkupLine("Retrieving AWS roles...");
 
-        var authenticationResult = await oktaLogin.InteractiveLogin(oktaUserProfile);
+        var samlData = await GetSamlDataWithSavedSession(oktaUserProfile, oktaAppUrl);
 
-        if (authenticationResult is not { HasSession: true })
-            throw new CommandException("Unable to create AWS credential profile, please try again");
+        if (samlData is null)
+        {
+            var authenticationResult = await oktaLogin.InteractiveLogin(oktaUserProfile);
 
-        var samlData = await oktaSamlService.GetAppSamlDataAsync(authenticationResult, oktaAppUrl);
+            if (authenticationResult is not { HasSession: true })
+                throw new CommandException("Unable to create AWS credential profile, please try again");
+
+            samlData = await oktaSamlService.GetAppSamlDataAsync(authenticationResult, oktaAppUrl);
+        }
 
         var awsRoles = await awsSamlService.GetAwsRolesWithAccountName(samlData);
 
@@ -146,5 +155,22 @@ public class CreateCredentialsProfile(
             choices.AddChoiceGroup($"[blue]{accountGroup.Key}[/]", accountGroup);
 
         return await AnsiConsole.PromptAsync(choices);
+    }
+
+    private async Task<SamlData?> GetSamlDataWithSavedSession(string oktaUserProfile, string oktaAppUrl)
+    {
+        var savedSession = await oktaLogin.ResumeSessionAsync(oktaUserProfile);
+
+        if (savedSession is null)
+            return null;
+
+        try
+        {
+            return await oktaSamlService.GetAppSamlDataAsync(savedSession, oktaAppUrl);
+        }
+        catch (Exception e) when (e is InvalidOperationException or HttpRequestException)
+        {
+            return null;
+        }
     }
 }

@@ -9,6 +9,7 @@ using Ellosoft.AwsCredentialsManager.Services.IO;
 using Ellosoft.AwsCredentialsManager.Services.Okta;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Sessions;
 using Ellosoft.AwsCredentialsManager.Services.Platforms.MacOS.Security;
 using Ellosoft.AwsCredentialsManager.Services.Platforms.Windows.Security;
 using Ellosoft.AwsCredentialsManager.Services.Security;
@@ -45,6 +46,14 @@ public static class ServiceRegistration
             .AddSingleton<IOktaVerifyAppLauncher, OktaVerifyAppLauncher>()
             .AddSingleton<IOktaFastPassChallengeHandler, OktaFastPassChallengeHandler>()
             .AddSingleton<IOktaIdxAuthenticator, OktaIdxAuthenticator>();
+
+        // okta session reuse services
+        services
+            .AddSingleton<IOktaSessionStore, OktaSessionStore>()
+            .AddSingleton<IOktaSessionClient, OktaSessionClient>()
+            .AddSingleton<IOktaSessionService, OktaSessionService>();
+
+        OktaSessionClient.ConfigureHttpClient(services.AddHttpClient(OktaSessionClient.HttpClientName));
 
         // aws related services
         services

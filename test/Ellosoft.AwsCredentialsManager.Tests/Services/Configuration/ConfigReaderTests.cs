@@ -56,6 +56,41 @@ public sealed class ConfigReaderTests : IDisposable
     }
 
     [Fact]
+    public void Read_ConfigWithSessionSettings_ShouldParseSessionSettings()
+    {
+        var yaml = """
+                   authentication:
+                     okta:
+                       default:
+                         okta_domain: https://test.okta.com/
+                         remember_session: false
+                   """;
+
+        var filePath = CreateTempFile(yaml);
+
+        var config = _configReader.Read(filePath);
+
+        config.Authentication.ShouldNotBeNull().Okta["default"].RememberSession.ShouldBe(false);
+    }
+
+    [Fact]
+    public void Read_ConfigWithoutSessionSettings_ShouldLeaveThemUnset()
+    {
+        var yaml = """
+                   authentication:
+                     okta:
+                       default:
+                         okta_domain: https://test.okta.com/
+                   """;
+
+        var filePath = CreateTempFile(yaml);
+
+        var config = _configReader.Read(filePath);
+
+        config.Authentication.ShouldNotBeNull().Okta["default"].RememberSession.ShouldBeNull();
+    }
+
+    [Fact]
     public void Read_ConfigWithVariables_ShouldSubstituteVariables()
     {
         var yaml = """

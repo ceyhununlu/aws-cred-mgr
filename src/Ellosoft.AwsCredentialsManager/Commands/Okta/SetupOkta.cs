@@ -55,6 +55,8 @@ public class SetupOkta(IOktaLoginService loginService, IConfigManager configMana
 
         CreateOktaProfile(settings.Profile, oktaDomain.ToString(), authResult.MfaUsed);
 
+        await loginService.SaveSessionAsync(settings.Profile, authResult);
+
         AnsiConsole.MarkupLine($"[bold green]All good, '{settings.Profile}' Okta profile created[/]");
 
         return 0;

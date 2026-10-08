@@ -8,6 +8,7 @@ using Ellosoft.AwsCredentialsManager.Services.Okta.Idx;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Models;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Models.HttpModels;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Sessions;
 using Ellosoft.AwsCredentialsManager.Services.Security;
 using NSubstitute;
 using NSubstitute.ExceptionExtensions;
@@ -25,13 +26,15 @@ public class OktaLoginServiceTests
     private readonly IUserCredentialsManager _userCredentialsManager = Substitute.For<IUserCredentialsManager>();
     private readonly IOktaClassicAuthenticator _classicAuthenticator = Substitute.For<IOktaClassicAuthenticator>();
     private readonly IOktaIdxAuthenticator _idxAuthenticator = Substitute.For<IOktaIdxAuthenticator>();
+    private readonly IOktaSessionService _sessionService = Substitute.For<IOktaSessionService>();
     private readonly OktaLoginService _loginService;
 
     public OktaLoginServiceTests()
     {
         _userCredentialsManager.GetUserCredentials(Profile).Returns(Credentials);
 
-        _loginService = new OktaLoginService(new TestConsole(), _configManager, _userCredentialsManager, _classicAuthenticator, _idxAuthenticator);
+        _loginService = new OktaLoginService(new TestConsole(), _configManager, _userCredentialsManager, _classicAuthenticator, _idxAuthenticator,
+            _sessionService);
     }
 
     [Fact]
@@ -67,7 +70,92 @@ public class OktaLoginServiceTests
         result.SessionToken.ShouldBe("session-token");
         result.SessionId.ShouldBe("102sid");
 
+        await _classicAuthenticator.Received(1).CreateSessionAsync(OktaDomain, "session-token");
         await _idxAuthenticator.DidNotReceiveWithAnyArgs().AuthenticateAsync(default!, default!, default!, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task InteractiveLogin_WithClassicAuthentication_ShouldCreateAndSaveOktaSession()
+    {
+        ConfigureProfile("push");
+
+        var classicResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionToken = "session-token" };
+        _classicAuthenticator.AuthenticateAsync(OktaDomain, Credentials.Username, Credentials.Password, "push").Returns(classicResult);
+        _classicAuthenticator.CreateSessionAsync(OktaDomain, "session-token").Returns(new CreateSessionResult { Id = "102sid", Status = "ACTIVE" });
+
+        var result = await _loginService.InteractiveLogin(Profile);
+
+        result.ShouldNotBeNull();
+        result.SessionId.ShouldBe("102sid");
+
+        _sessionService.Received(1).Save(Profile, Arg.Is<AuthenticationResult>(r => r.SessionId == "102sid"));
+    }
+
+    [Fact]
+    public async Task InteractiveLogin_WhenSessionIsNotRemembered_ShouldNotCreateOrSaveOktaSession()
+    {
+        ConfigureProfile("push", rememberSession: false);
+
+        var classicResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionToken = "session-token" };
+        _classicAuthenticator.AuthenticateAsync(OktaDomain, Credentials.Username, Credentials.Password, "push").Returns(classicResult);
+
+        var result = await _loginService.InteractiveLogin(Profile);
+
+        result.ShouldBe(classicResult);
+
+        await _classicAuthenticator.DidNotReceiveWithAnyArgs().CreateSessionAsync(default!, default!);
+        _sessionService.DidNotReceiveWithAnyArgs().Save(default!, default!);
+    }
+
+    [Fact]
+    public async Task InteractiveLogin_WhenAuthenticationFails_ShouldNotSaveOktaSession()
+    {
+        ConfigureProfile("push");
+
+        _classicAuthenticator.AuthenticateAsync(OktaDomain, Credentials.Username, Credentials.Password, "push")
+            .Returns(new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = false });
+
+        var result = await _loginService.InteractiveLogin(Profile);
+
+        result.ShouldNotBeNull();
+        result.Authenticated.ShouldBeFalse();
+
+        _sessionService.DidNotReceiveWithAnyArgs().Save(default!, default!);
+    }
+
+    [Fact]
+    public async Task ResumeSessionAsync_ShouldReturnSavedSession()
+    {
+        ConfigureProfile("push");
+
+        var savedSession = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid", IsResumedSession = true };
+        _sessionService.ResumeAsync(Profile, OktaDomain, Arg.Any<CancellationToken>()).Returns(savedSession);
+
+        var result = await _loginService.ResumeSessionAsync(Profile);
+
+        result.ShouldBe(savedSession);
+    }
+
+    [Fact]
+    public async Task ResumeSessionAsync_WhenSessionIsNotRemembered_ShouldNotUseSavedSession()
+    {
+        ConfigureProfile("push", rememberSession: false);
+
+        var result = await _loginService.ResumeSessionAsync(Profile);
+
+        result.ShouldBeNull();
+        await _sessionService.DidNotReceiveWithAnyArgs().ResumeAsync(default!, default!, TestContext.Current.CancellationToken);
+    }
+
+    [Fact]
+    public async Task LogoutAsync_ShouldEndSavedSession()
+    {
+        ConfigureProfile("push");
+        _sessionService.EndAsync(Profile, OktaDomain, Arg.Any<CancellationToken>()).Returns(true);
+
+        var result = await _loginService.LogoutAsync(Profile);
+
+        result.ShouldBeTrue();
     }
 
     [Fact]
@@ -82,7 +170,7 @@ public class OktaLoginServiceTests
         _userCredentialsManager.Received(1).SaveUserCredentials(Profile, Arg.Is<UserCredentials>(c => c.Username == Credentials.Username && c.Password == string.Empty));
     }
 
-    private void ConfigureProfile(string? preferredMfa)
+    private void ConfigureProfile(string? preferredMfa, bool? rememberSession = null)
     {
         var config = new AppConfig
         {
@@ -90,7 +178,7 @@ public class OktaLoginServiceTests
             {
                 Okta = new Dictionary<string, OktaConfiguration>
                 {
-                    [Profile] = new() { OktaDomain = OktaDomain.ToString(), PreferredMfaType = preferredMfa }
+                    [Profile] = new() { OktaDomain = OktaDomain.ToString(), PreferredMfaType = preferredMfa, RememberSession = rememberSession }
                 }
             }
         };

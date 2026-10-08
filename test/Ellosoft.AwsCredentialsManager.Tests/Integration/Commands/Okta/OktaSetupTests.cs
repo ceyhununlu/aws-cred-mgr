@@ -45,6 +45,13 @@ public sealed class OktaSetupTests(ITestOutputHelper outputHelper, TestFixture t
         TestRequestsFilter.Requests[TestCorrelationId][0]
             .Request.RequestUri.ShouldBe(new Uri($"{domain}/api/v1/authn"));
 
+        // the session token is exchanged for an Okta session, which is saved to renew AWS credentials without signing in again
+        TestRequestsFilter.Requests[TestCorrelationId][1]
+            .RequestModel.ShouldBe(new CreateSessionRequest("session_token"));
+
+        TestRequestsFilter.Requests[TestCorrelationId][1]
+            .Request.RequestUri.ShouldBe(new Uri($"{domain}/api/v1/sessions"));
+
         var userCredentialsService = TestFixture.WebApp.Services.GetRequiredService<IUserCredentialsManager>();
 
         var userCredentials = userCredentialsService.GetUserCredentials(_profileName);
@@ -58,5 +65,6 @@ public sealed class OktaSetupTests(ITestOutputHelper outputHelper, TestFixture t
     {
         var secureStorage = TestFixture.WebApp.Services.GetRequiredService<ISecureStorage>();
         secureStorage.DeleteSecret(_profileName);
+        secureStorage.DeleteSecret($"okta_session_{_profileName}");
     }
 }

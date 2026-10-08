@@ -41,6 +41,7 @@ app.Configure(config =>
         .AddBranch<OktaBranch>(okta =>
         {
             okta.AddCommand<SetupOkta>();
+            okta.AddCommand<LogoutOkta>();
         })
         .AddBranch<CredentialsBranch>(cred =>
         {

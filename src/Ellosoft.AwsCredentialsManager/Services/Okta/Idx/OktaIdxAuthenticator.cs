@@ -71,6 +71,7 @@ public class OktaIdxAuthenticator(
                     Authenticated = true,
                     SessionId = sessionId,
                     SessionCookies = sessionCookies,
+                    UserAgent = OktaHttpClient.GetPlatformUserAgent(),
                     MfaUsed = OktaMfaFactorSelector.FastPassFactorCode
                 };
             }

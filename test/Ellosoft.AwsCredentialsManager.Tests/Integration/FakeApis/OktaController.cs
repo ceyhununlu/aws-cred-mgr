@@ -20,6 +20,19 @@ public class OktaController : ControllerBase
         });
     }
 
+    [HttpPost("sessions")]
+    public ActionResult<CreateSessionResult> CreateSession([FromBody] CreateSessionRequest request)
+    {
+        return Ok(new CreateSessionResult
+        {
+            Id = OktaIdxController.SessionId,
+            UserId = "00u1",
+            Login = "john@xyz.com",
+            Status = "ACTIVE",
+            ExpiresAt = DateTime.UtcNow.AddHours(2)
+        });
+    }
+
     [HttpGet("sessions/me")]
     public IActionResult GetCurrentSession()
     {

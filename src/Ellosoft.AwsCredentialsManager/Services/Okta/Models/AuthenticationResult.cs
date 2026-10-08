@@ -22,12 +22,22 @@ public record AuthenticationResult
     /// </summary>
     public CookieContainer? SessionCookies { get; init; }
 
+    /// <summary>
+    ///     User agent of the client that created the Okta session, requests reusing the session identify themselves the same way
+    /// </summary>
+    public string? UserAgent { get; init; }
+
+    /// <summary>
+    ///     True when the session was restored from the secure storage instead of being created by a new sign-in
+    /// </summary>
+    public bool IsResumedSession { get; init; }
+
     public bool Authenticated { get; init; }
 
     /// <summary>
-    ///     True when the result carries an Okta session: a session token (classic authentication)
-    ///     or a session id (Identity Engine / FastPass authentication, where the session cookie is the session)
+    ///     True when the result carries an Okta session: a session token (classic authentication),
+    ///     a session id or session cookies (Identity Engine / FastPass authentication, where the session cookie is the session)
     /// </summary>
-    public bool HasSession => Authenticated && (SessionToken is not null || SessionId is not null);
+    public bool HasSession => Authenticated && (SessionToken is not null || SessionId is not null || SessionCookies is not null);
 }
 

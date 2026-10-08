@@ -5,6 +5,7 @@ using Ellosoft.AwsCredentialsManager.Services.Configuration.Interactive;
 using Ellosoft.AwsCredentialsManager.Services.Configuration.Models;
 using Ellosoft.AwsCredentialsManager.Services.Okta;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Interactive;
+using Microsoft.Extensions.Logging;
 
 namespace Ellosoft.AwsCredentialsManager.Services.AWS.Interactive;
 
@@ -18,33 +19,53 @@ public class AwsOktaSessionManager(
     IOktaLoginService loginService,
     IOktaSamlService oktaSamlService,
     IAwsCredentialsService awsCredentialsService,
-    IAwsSamlService awsSamlService) : IAwsOktaSessionManager
+    IAwsSamlService awsSamlService,
+    ILogger<AwsOktaSessionManager> logger) : IAwsOktaSessionManager
 {
+    private const int RENEWAL_THRESHOLD_IN_MINUTES = 60;
+
     public async Task<AWSCredentials?> CreateOrResumeSessionAsync(string credentialProfile, string? outputAwsProfile, bool forceRenew = false)
     {
         if (!credentialsManager.TryGetCredential(credentialProfile, out var credentialsConfig))
             return null;
 
+        if (credentialsConfig is not { OktaProfile: { } oktaProfile, OktaAppUrl: { } oktaAppUrl })
+            throw new InvalidOperationException($"The credential '{credentialProfile}' does not have an Okta profile and Okta app URL configured");
+
         var awsProfile = credentialsConfig.GetAwsProfileSafe(credentialProfile);
+        var storedCredentials = forceRenew ? null : GetStoredCredentials(awsProfile, credentialsConfig.RoleArn);
 
-        if (!forceRenew && TryResumeSession(awsProfile, credentialsConfig.RoleArn, out var awsCredentialsData))
-            return CreateAwsCredentials(awsCredentialsData, awsProfile, outputAwsProfile);
+        if (storedCredentials is not null && storedCredentials.ExpirationDateTime >= DateTime.Now.AddMinutes(RENEWAL_THRESHOLD_IN_MINUTES))
+            return CreateAwsCredentials(storedCredentials, awsProfile, outputAwsProfile);
 
-        var newCredential = await CreateSessionAsync(credentialProfile, awsProfile, credentialsConfig);
+        // renewing with the saved Okta session needs no user interaction, so it happens before asking the user anything
+        var samlData = await GetSamlDataWithSavedOktaSessionAsync(oktaProfile, oktaAppUrl);
 
-        return newCredential is not null ? CreateAwsCredentials(newCredential, awsProfile, outputAwsProfile) : null;
+        if (samlData is null)
+        {
+            if (storedCredentials is not null && !ConfirmRenewal(storedCredentials))
+                return CreateAwsCredentials(storedCredentials, awsProfile, outputAwsProfile);
+
+            samlData = await GetSamlDataWithNewOktaSessionAsync(oktaProfile, oktaAppUrl);
+
+            if (samlData is null)
+                return null;
+        }
+
+        var newCredentials = await AssumeRoleAsync(credentialProfile, awsProfile, credentialsConfig, samlData);
+
+        return newCredentials is not null ? CreateAwsCredentials(newCredentials, awsProfile, outputAwsProfile) : null;
     }
 
-    private bool TryResumeSession(string awsProfile, string roleArn, [NotNullWhen(true)] out AwsCredentialsData? credentialsData)
+    private AwsCredentialsData? GetStoredCredentials(string awsProfile, string roleArn)
     {
-        credentialsData = awsCredentialsService.GetCredentialsFromStore(awsProfile);
+        var credentialsData = awsCredentialsService.GetCredentialsFromStore(awsProfile);
 
-        if (credentialsData is null || credentialsData.RoleArn != roleArn)
-            return false;
+        return credentialsData?.RoleArn == roleArn ? credentialsData : null;
+    }
 
-        if (credentialsData.ExpirationDateTime >= DateTime.Now.AddMinutes(60))
-            return true;
-
+    private static bool ConfirmRenewal(AwsCredentialsData credentialsData)
+    {
         var expirationInMinutes = (int)(credentialsData.ExpirationDateTime - DateTime.Now).TotalMinutes;
 
         var renewCredentialsMessage = $"""
@@ -55,24 +76,49 @@ public class AwsOktaSessionManager(
 
         AnsiConsole.WriteLine();
 
-        if (AnsiConsole.Confirm(renewCredentialsMessage, defaultValue: false))
-            return false;
-
-        return true;
+        return AnsiConsole.Confirm(renewCredentialsMessage, defaultValue: false);
     }
 
-    private async Task<AwsCredentialsData?> CreateSessionAsync(string credentialProfile, string awsProfile, CredentialsConfiguration credentialsConfig)
+    private async Task<SamlData?> GetSamlDataWithSavedOktaSessionAsync(string oktaProfile, string oktaAppUrl)
     {
-        if (credentialsConfig is not { OktaProfile: { } oktaProfile, OktaAppUrl: { } oktaAppUrl })
-            throw new InvalidOperationException($"The credential '{credentialProfile}' does not have an Okta profile and Okta app URL configured");
+        var savedSession = await loginService.ResumeSessionAsync(oktaProfile);
 
+        if (savedSession is null)
+            return null;
+
+        try
+        {
+            var samlData = await oktaSamlService.GetAppSamlDataAsync(savedSession, oktaAppUrl);
+
+            // Okta may have refreshed the session cookies while serving the app
+            await loginService.SaveSessionAsync(oktaProfile, savedSession);
+
+            AnsiConsole.MarkupLine("[green]Using your saved Okta session, no sign-in required[/]");
+
+            return samlData;
+        }
+        catch (Exception e) when (e is InvalidOperationException or HttpRequestException)
+        {
+            logger.LogInformation(e, "The saved Okta session was not accepted for {OktaAppUrl}", oktaAppUrl);
+            AnsiConsole.MarkupLine("[grey]Okta requires you to sign in again[/]");
+
+            return null;
+        }
+    }
+
+    private async Task<SamlData?> GetSamlDataWithNewOktaSessionAsync(string oktaProfile, string oktaAppUrl)
+    {
         var authResult = await loginService.InteractiveLogin(oktaProfile);
 
         if (authResult is not { HasSession: true })
             return null;
 
-        var samlData = await oktaSamlService.GetAppSamlDataAsync(authResult, oktaAppUrl);
+        return await oktaSamlService.GetAppSamlDataAsync(authResult, oktaAppUrl);
+    }
 
+    private async Task<AwsCredentialsData?> AssumeRoleAsync(string credentialProfile, string awsProfile, CredentialsConfiguration credentialsConfig,
+        SamlData samlData)
+    {
         var idp = GetRoleIdp(credentialProfile, credentialsConfig.RoleArn, samlData.SamlAssertion);
 
         if (idp is null)

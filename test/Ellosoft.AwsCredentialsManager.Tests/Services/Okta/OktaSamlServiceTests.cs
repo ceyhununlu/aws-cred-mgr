@@ -2,6 +2,7 @@
 
 using System.Net;
 using Ellosoft.AwsCredentialsManager.Services.Okta;
+using Ellosoft.AwsCredentialsManager.Services.Okta.Exceptions;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Models;
 using Ellosoft.AwsCredentialsManager.Tests.Services.Okta.Idx;
 
@@ -86,6 +87,32 @@ public class OktaSamlServiceTests
     }
 
     [Fact]
+    public async Task GetAppSamlDataAsync_WithSessionIdAndUsedSessionToken_ShouldUseSessionId()
+    {
+        // the session token was already exchanged for the session and cannot be redeemed again
+        _handler.On(HttpMethod.Get, OktaAppUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(SamlPage)));
+
+        var authResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionToken = "used-token", SessionId = "102sid" };
+
+        await _samlService.GetAppSamlDataAsync(authResult, OktaAppUrl);
+
+        _handler.Requests.ShouldHaveSingleItem().Url.ShouldBe(OktaAppUrl);
+    }
+
+    [Fact]
+    public async Task GetAppSamlDataAsync_WithSavedSession_ShouldIdentifyAsTheClientThatCreatedTheSession()
+    {
+        const string USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Safari/537.36 Edg/141.0";
+        _handler.On(HttpMethod.Get, OktaAppUrl, _ => Task.FromResult(FakeHttpMessageHandler.Html(SamlPage)));
+
+        var authResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid", UserAgent = USER_AGENT };
+
+        await _samlService.GetAppSamlDataAsync(authResult, OktaAppUrl);
+
+        _handler.RequestsTo(HttpMethod.Get, OktaAppUrl).ShouldHaveSingleItem().Request.Headers.UserAgent.ToString().ShouldBe(USER_AGENT);
+    }
+
+    [Fact]
     public async Task GetAppSamlDataAsync_WhenOktaReturnsSignInPageInsteadOfSaml_ShouldExplainAdditionalVerification()
     {
         const string SIGN_IN_PAGE = "<html><script>var stateToken = '02app\\x2Dstep\\x2Dup';</script></html>";
@@ -93,7 +120,7 @@ public class OktaSamlServiceTests
 
         var authResult = new AuthenticationResult { OktaDomain = OktaDomain, Authenticated = true, SessionId = "102sid" };
 
-        var exception = await Should.ThrowAsync<InvalidOperationException>(() => _samlService.GetAppSamlDataAsync(authResult, OktaAppUrl));
+        var exception = await Should.ThrowAsync<OktaAppReauthenticationRequiredException>(() => _samlService.GetAppSamlDataAsync(authResult, OktaAppUrl));
 
         exception.Message.ShouldContain("additional verification");
     }
