@@ -9,6 +9,8 @@ AWS Credential Manager (`aws-cred-mgr`) is a command-line interface (CLI) tool d
 ## Features
 
 - **Okta Authentication**: Easily setup Okta authentication for you user (Okta Verify push, TOTP code or Okta FastPass)
+- **Okta Session Reuse**: Expired AWS credentials are renewed with your saved Okta session, without asking for MFA again
+- **Browser Sign-in**: Sign in to Okta in Microsoft Edge or Google Chrome (used for Okta FastPass on Windows)
 - **Credential Management**: Create and list AWS credentials, manage profiles with ease.
 - **RDS Token Management**: Obtain RDS passwords for your databases securely.
 
@@ -58,6 +60,8 @@ aws-cred-mgr okta setup
 - Simply run `aws-cred-mgr okta setup` to use interactive mode.
 - Set up with domain and username: `aws-cred-mgr okta setup -d https://xyz.okta.com -u john --mfa push`
 - Set up using Okta FastPass (Okta Verify desktop app): `aws-cred-mgr okta setup -d https://xyz.okta.com -u john --mfa fastpass`
+- Set up signing in through the browser (any MFA your org uses): `aws-cred-mgr okta setup -d https://xyz.okta.com -u john --browser`
+- Sign out and forget the saved Okta session: `aws-cred-mgr okta logout` (or `aws-cred-mgr okta logout xyz_profile`)
 
 #### MFA types
 
@@ -93,6 +97,39 @@ Requirements and troubleshooting:
 - The login times out after 2 minutes waiting for approval; simply rerun the command.
 - Run any command with the hidden `--log-level debug` option to write detailed diagnostics (including the Okta
   responses) to `~/.aws_cred_mgr/aws-cred-mgr.log` when reporting issues.
+- On Windows, FastPass sign-ins run in the browser, see [Browser sign-in](#browser-sign-in-okta-fastpass-on-windows).
+
+#### Okta session reuse
+
+Like a browser, `aws-cred-mgr` remembers your Okta session after you sign in. When your AWS credentials expire (or
+when you use `--force-renew`), it asks Okta for a new SAML assertion with the saved session first, so **no password,
+push or FastPass prompt is needed** while the Okta session is active. You only sign in again once Okta ends the session.
+
+- The session is saved in the **macOS Keychain** or with **Windows DPAPI** (the same secure storage used for your
+  Okta password), never in plain text. It is checked with Okta (`/api/v1/sessions/me`) before being used.
+- How long the session lasts is decided by your Okta org (global session policy: maximum session lifetime and idle
+  timeout). If the AWS app's authentication policy requires MFA on every sign-in, Okta rejects the saved session for
+  the app and `aws-cred-mgr` falls back to a normal sign-in.
+- Disable it for an Okta profile with `remember_session: false`.
+- `aws-cred-mgr okta logout [PROFILE]` signs out of Okta and removes the saved session.
+
+#### Browser sign-in (Okta FastPass on Windows)
+
+On Windows, Okta usually signs FastPass users in through the browser: the Okta sign-in page uses Desktop SSO or opens
+Okta Verify itself. That flow cannot be reproduced outside a browser, so on Windows `--mfa fastpass` (and any profile
+with `auth_type: browser`, on any OS) signs in through **Microsoft Edge** or **Google Chrome**:
+
+1. `aws-cred-mgr` opens a browser window with its own browser profile (`~/.aws_cred_mgr/browser-profile`), separate
+   from your everyday browser profile.
+2. The Okta sign-in page opens (your username, and your saved password if any, are filled in for you on your Okta
+   domain only). Complete the sign-in as usual: when Okta asks for FastPass, the page opens Okta Verify. The first time,
+   allow the browser to open Okta Verify and, if asked, to access apps on this device (tick "Always allow").
+3. Once Okta signs you in to the AWS app, `aws-cred-mgr` picks up the SAML response (the browser does not continue to
+   the AWS console), saves the Okta session and closes the window.
+
+Because the browser profile keeps its own Okta cookies, the next browser sign-in often completes on its own. Use
+`browser_path` in the `config` section to choose the browser. If your organization disables browser remote debugging
+(used to read the sign-in result), `aws-cred-mgr` tries the other browser and reports it when neither can be used.
 
 ### Credential Management
 
@@ -112,6 +149,10 @@ aws-cred-mgr cred [COMMAND]
 - List credentials: `aws-cred-mgr cred ls`
 - Get the AWS credentials for `prod` and stores it in ~/.aws/credentials: `aws-cred-mgr cred get prod`
 - Force renew AWS credentials even if the current session is still valid: `aws-cred-mgr cred get prod --force-renew`
+
+AWS credentials are valid for 2 hours by default. Set `session_duration` (in minutes, 15 to 720) on a credential to
+change it. When it exceeds the maximum session duration of the AWS role (1 hour unless the role is configured for
+longer), `aws-cred-mgr` requests 1 hour instead.
 
 ### RDS Token Management
 
@@ -143,13 +184,17 @@ The `config` section in the YAML file allows you to set global tool configuratio
 
 - `copy_to_clipboard`: When set to `true`, the tool will automatically copy generated passwords to the clipboard. Default is `true`.
 - `aws_ignore_configured_endpoints`: When set to `true`, the tool will ignore any pre-configured AWS endpoints. This can be useful in certain network environments. Default is `true`.
+- `browser_path`: Browser used for browser sign-in (any Chromium based browser, e.g. Edge or Chrome). By default Microsoft Edge (then Google Chrome) is used on Windows and Google Chrome (then Microsoft Edge) on macOS.
 
 ## Security Note for Windows and macOS Users
 
-On Windows systems, `aws-cred-mgr` securely stores your Okta credentials using the Data Protection API (DPAPI).
+On Windows systems, `aws-cred-mgr` securely stores your Okta credentials and Okta session using the Data Protection API (DPAPI).
 This ensures that your sensitive information is encrypted and can only be accessed by your user account on your computer.
 
-On macOs systems, `aws-cred-mgr` securely stores your Okta credentials using the native Keychain API.
+On macOs systems, `aws-cred-mgr` securely stores your Okta credentials and Okta session using the native Keychain API.
+
+The browser profile used for browser sign-in (`~/.aws_cred_mgr/browser-profile`) holds Okta cookies like any browser
+profile; `aws-cred-mgr okta logout` ends the Okta session.
 
 Linux support is still under development
 
@@ -168,7 +213,8 @@ authentication:
         default: # default Okta profile name, additional profiles can also be created
             okta_domain: https://xyz.okta.com/
             preferred_mfa_type: push # also: totp | code | fastpass (Okta Verify desktop app, stored as signed_nonce)
-            auth_type: classic
+            auth_type: classic # or browser (sign in through Microsoft Edge / Google Chrome)
+            remember_session: true # reuse the Okta session to renew AWS credentials (default: true)
 
 credentials:
     my_aws_dev_account: # credentials can be interactively created with `aws-cred-mgr cred new`
@@ -176,6 +222,7 @@ credentials:
         aws_profile: default
         okta_app_url: https://xyz.okta.com/home/amazon_aws/abc/272
         okta_profile: default
+        session_duration: 120 # AWS credentials lifetime in minutes (default: 120)
     ...
 
 templates:
@@ -212,6 +259,7 @@ environments:
 # config:
 #    copy_to_clipboard: true
 #    aws_ignore_configured_endpoints: true
+#    browser_path: C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
 ```
 
 ## Support

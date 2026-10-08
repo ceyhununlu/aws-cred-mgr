@@ -7,7 +7,8 @@ authentication:
     default:
       okta_domain: https://xyz.okta.com/
       preferred_mfa_type: push # push | token:software:totp | signed_nonce (Okta FastPass, Okta Verify desktop app)
-      auth_type: classic
+      auth_type: classic # classic | browser (sign in through Microsoft Edge / Google Chrome)
+      remember_session: true # reuse the Okta session to renew AWS credentials, default value is true
 
 credentials:
   my_aws_dev_account:
@@ -15,6 +16,7 @@ credentials:
     aws_profile: default
     okta_app_url: https://xyz.okta.com/home/amazon_aws/abc/272
     okta_profile: default
+    session_duration: 120 # AWS credentials lifetime in minutes, default value is 120
   my_aws_prod_account:
     role_arn: arn:aws:iam::456:role:/my_aws_prod_role_arn
     aws_profile: prod
@@ -60,3 +62,4 @@ environments:
 config:
   aws_ignore_configured_endpoints: false # default value is true
   copy_to_clipboard: false # default value is true
+  # browser_path: C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe # browser sign-in, Edge or Chrome is detected by default
