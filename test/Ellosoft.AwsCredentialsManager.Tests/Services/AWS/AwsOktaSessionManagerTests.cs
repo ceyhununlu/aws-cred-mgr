@@ -43,21 +43,7 @@ public class AwsOktaSessionManagerTests
             _awsSamlService,
             NullLogger<AwsOktaSessionManager>.Instance);
 
-        var credentialsConfig = new CredentialsConfiguration
-        {
-            RoleArn = RoleArn,
-            AwsProfile = AwsProfile,
-            OktaProfile = OktaProfile,
-            OktaAppUrl = OktaAppUrl
-        };
-
-        _credentialsManager.TryGetCredential(CredentialProfile, out Arg.Any<CredentialsConfiguration?>())
-            .Returns(x =>
-            {
-                x[1] = credentialsConfig;
-
-                return true;
-            });
+        ConfigureCredential(sessionDuration: null);
 
         _awsSamlService.GetAwsRolesAndIdpFromSamlAssertion("saml-assertion")
             .Returns(new Dictionary<string, string> { [RoleArn] = IdpArn });
@@ -224,6 +210,55 @@ public class AwsOktaSessionManagerTests
 
         (await result.ShouldBeOfType<SessionAWSCredentials>().GetCredentialsAsync()).AccessKey.ShouldBe("NEW_KEY");
         await _loginService.DidNotReceiveWithAnyArgs().InteractiveLogin(default!, default, default);
+    }
+
+    [Fact]
+    public async Task CreateOrResumeSessionAsync_WithSessionDuration_ShouldRequestCredentialsForThatDuration()
+    {
+        ConfigureCredential(sessionDuration: 480);
+        _awsCredentialsService.GetCredentialsFromStore(AwsProfile).Returns((AwsCredentialsData?)null);
+
+        var savedSession = CreateSavedSession();
+        _loginService.ResumeSessionAsync(OktaProfile).Returns(savedSession);
+        _oktaSamlService.GetAppSamlDataAsync(savedSession, OktaAppUrl).Returns(SamlData);
+        _awsCredentialsService.GetAwsCredentials("saml-assertion", RoleArn, IdpArn, 480).Returns(CreateFreshCredentials());
+
+        var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile);
+
+        result.ShouldNotBeNull();
+        await _awsCredentialsService.Received(1).GetAwsCredentials("saml-assertion", RoleArn, IdpArn, 480);
+    }
+
+    [Fact]
+    public async Task CreateOrResumeSessionAsync_WithShortSessionDuration_ShouldKeepCredentialsUntilHalfOfTheDurationIsLeft()
+    {
+        ConfigureCredential(sessionDuration: 60);
+        _awsCredentialsService.GetCredentialsFromStore(AwsProfile).Returns(CreateCachedCredentials(DateTime.Now.AddMinutes(45)));
+
+        var result = await _sessionManager.CreateOrResumeSessionAsync(CredentialProfile, AwsProfile);
+
+        (await result.ShouldBeOfType<SessionAWSCredentials>().GetCredentialsAsync()).AccessKey.ShouldBe("CACHED_KEY");
+        await _loginService.DidNotReceiveWithAnyArgs().ResumeSessionAsync(default!);
+    }
+
+    private void ConfigureCredential(int? sessionDuration)
+    {
+        var credentialsConfig = new CredentialsConfiguration
+        {
+            RoleArn = RoleArn,
+            AwsProfile = AwsProfile,
+            OktaProfile = OktaProfile,
+            OktaAppUrl = OktaAppUrl,
+            SessionDuration = sessionDuration
+        };
+
+        _credentialsManager.TryGetCredential(CredentialProfile, out Arg.Any<CredentialsConfiguration?>())
+            .Returns(x =>
+            {
+                x[1] = credentialsConfig;
+
+                return true;
+            });
     }
 
     private static AuthenticationResult CreateSavedSession() =>

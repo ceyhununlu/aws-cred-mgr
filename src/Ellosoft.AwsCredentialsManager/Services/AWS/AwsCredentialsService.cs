@@ -20,7 +20,10 @@ public interface IAwsCredentialsService
     /// <param name="samlAssertion">A SAML authentication assertion used to authenticate the call to AWS STS.</param>
     /// <param name="roleArn">AWS role to be assumed.</param>
     /// <param name="idp">ARN of the SAML provider in AWS.</param>
-    /// <param name="expirationInMinutes">The duration, in minutes, for which the temporary security credentials are valid. (default 120 min)</param>
+    /// <param name="expirationInMinutes">
+    ///     The duration, in minutes, for which the temporary security credentials are valid. (default 120 min)
+    ///     When it exceeds the maximum session duration of the role, 60 minutes (default role maximum) are requested instead
+    /// </param>
     /// <returns>AwsCredentialsData containing retrieved temporary AWS credentials.</returns>
     /// <exception cref="InvalidOperationException">
     ///     Thrown when the SAML authentication assertion fails to meet the requirements
@@ -54,9 +57,19 @@ public interface IAwsCredentialsService
     AwsCredentialsData? GetCredentialsFromStore(string awsProfileName);
 }
 
-public class AwsCredentialsService(ILogger<AwsCredentialsService> logger) : IAwsCredentialsService
+public class AwsCredentialsService(ILogger<AwsCredentialsService> logger, Func<IAmazonSecurityTokenService> stsClientFactory) : IAwsCredentialsService
 {
+    /// <summary>
+    ///     Maximum session duration of AWS roles unless the role is configured otherwise
+    /// </summary>
+    private const int DEFAULT_ROLE_MAX_SESSION_DURATION_IN_MINUTES = 60;
+
     internal sealed record ProfileMetadata(string RoleArn, string AccessKey, DateTime Expiration);
+
+    public AwsCredentialsService(ILogger<AwsCredentialsService> logger)
+        : this(logger, () => new AmazonSecurityTokenServiceClient(new AnonymousAWSCredentials(), RegionEndpoint.USEast2))
+    {
+    }
 
     public async Task<AwsCredentialsData> GetAwsCredentials(
         string samlAssertion,
@@ -64,8 +77,43 @@ public class AwsCredentialsService(ILogger<AwsCredentialsService> logger) : IAws
         string idp,
         int expirationInMinutes = 120)
     {
-        using var stsClient = new AmazonSecurityTokenServiceClient(new AnonymousAWSCredentials(), RegionEndpoint.USEast2);
+        using var stsClient = stsClientFactory();
 
+        try
+        {
+            return await AssumeRoleWithSessionDurationFallbackAsync(stsClient, samlAssertion, roleArn, idp, expirationInMinutes);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Unable to assume AWS role {roleArn} using SAML", ex);
+        }
+    }
+
+    private async Task<AwsCredentialsData> AssumeRoleWithSessionDurationFallbackAsync(IAmazonSecurityTokenService stsClient, string samlAssertion,
+        string roleArn, string idp, int expirationInMinutes)
+    {
+        try
+        {
+            return await AssumeRoleWithSamlAsync(stsClient, samlAssertion, roleArn, idp, expirationInMinutes);
+        }
+        catch (AmazonSecurityTokenServiceException e) when (expirationInMinutes > DEFAULT_ROLE_MAX_SESSION_DURATION_IN_MINUTES &&
+                                                            IsMaxSessionDurationExceeded(e))
+        {
+            logger.LogWarning(e, "The session duration of {Duration} minutes exceeds the maximum session duration of {RoleArn}", expirationInMinutes, roleArn);
+
+            AnsiConsole.MarkupLineInterpolated(
+                $"""
+                 [yellow]The AWS role {roleArn} does not allow sessions of {expirationInMinutes} minutes, requesting {DEFAULT_ROLE_MAX_SESSION_DURATION_IN_MINUTES} minutes instead.
+                 Set 'session_duration' in the credential to change it[/]
+                 """);
+
+            return await AssumeRoleWithSamlAsync(stsClient, samlAssertion, roleArn, idp, DEFAULT_ROLE_MAX_SESSION_DURATION_IN_MINUTES);
+        }
+    }
+
+    private static async Task<AwsCredentialsData> AssumeRoleWithSamlAsync(IAmazonSecurityTokenService stsClient, string samlAssertion, string roleArn,
+        string idp, int expirationInMinutes)
+    {
         var request = new AssumeRoleWithSAMLRequest
         {
             DurationSeconds = expirationInMinutes * 60,
@@ -74,22 +122,21 @@ public class AwsCredentialsService(ILogger<AwsCredentialsService> logger) : IAws
             SAMLAssertion = samlAssertion
         };
 
-        try
-        {
-            var response = await stsClient.AssumeRoleWithSAMLAsync(request);
+        var response = await stsClient.AssumeRoleWithSAMLAsync(request);
 
-            return new AwsCredentialsData(
-                response.Credentials.AccessKeyId,
-                response.Credentials.SecretAccessKey,
-                response.Credentials.SessionToken,
-                response.Credentials.Expiration ?? DateTime.UtcNow.AddHours(1),
-                roleArn);
-        }
-        catch (Exception ex)
-        {
-            throw new InvalidOperationException($"Unable to assume AWS role {roleArn} using SAML", ex);
-        }
+        return new AwsCredentialsData(
+            response.Credentials.AccessKeyId,
+            response.Credentials.SecretAccessKey,
+            response.Credentials.SessionToken,
+            response.Credentials.Expiration ?? DateTime.UtcNow.AddHours(1),
+            roleArn);
     }
+
+    /// <summary>
+    ///     STS rejects durations above the role maximum with: "The requested DurationSeconds exceeds the MaxSessionDuration set for this role."
+    /// </summary>
+    private static bool IsMaxSessionDurationExceeded(AmazonSecurityTokenServiceException exception) =>
+        exception.ErrorCode == "ValidationError" && exception.Message.Contains("MaxSessionDuration", StringComparison.OrdinalIgnoreCase);
 
     public void StoreCredentials(string awsProfileName, AwsCredentialsData credentials)
     {

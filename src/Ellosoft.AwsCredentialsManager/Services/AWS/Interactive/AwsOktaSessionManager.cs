@@ -35,7 +35,10 @@ public class AwsOktaSessionManager(
         var awsProfile = credentialsConfig.GetAwsProfileSafe(credentialProfile);
         var storedCredentials = forceRenew ? null : GetStoredCredentials(awsProfile, credentialsConfig.RoleArn);
 
-        if (storedCredentials is not null && storedCredentials.ExpirationDateTime >= DateTime.Now.AddMinutes(RENEWAL_THRESHOLD_IN_MINUTES))
+        // short sessions would otherwise be renewed on every run
+        var renewalThreshold = Math.Min(RENEWAL_THRESHOLD_IN_MINUTES, credentialsConfig.GetSessionDurationSafe() / 2);
+
+        if (storedCredentials is not null && storedCredentials.ExpirationDateTime >= DateTime.Now.AddMinutes(renewalThreshold))
             return CreateAwsCredentials(storedCredentials, awsProfile, outputAwsProfile);
 
         // renewing with the saved Okta session needs no user interaction, so it happens before asking the user anything
@@ -124,7 +127,8 @@ public class AwsOktaSessionManager(
         if (idp is null)
             return null;
 
-        var awsCredentialsData = await awsCredentialsService.GetAwsCredentials(samlData.SamlAssertion, credentialsConfig.RoleArn, idp);
+        var awsCredentialsData = await awsCredentialsService.GetAwsCredentials(samlData.SamlAssertion, credentialsConfig.RoleArn, idp,
+            credentialsConfig.GetSessionDurationSafe());
 
         awsCredentialsService.StoreCredentials(awsProfile, awsCredentialsData);
 

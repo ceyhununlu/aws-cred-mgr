@@ -66,6 +66,13 @@ public sealed class ConfigReaderTests : IDisposable
                          auth_type: browser
                          remember_session: false
 
+                   credentials:
+                     test_profile:
+                       role_arn: arn:aws:iam::123:role:/test_role
+                       okta_app_url: https://test.okta.com/home/amazon_aws/abc/272
+                       okta_profile: default
+                       session_duration: 480
+
                    config:
                      browser_path: C:\Program Files\Google\Chrome\Application\chrome.exe
                    """;
@@ -78,6 +85,7 @@ public sealed class ConfigReaderTests : IDisposable
         oktaProfile.AuthType.ShouldBe("browser");
         oktaProfile.RememberSession.ShouldBe(false);
 
+        config.Credentials["test_profile"].SessionDuration.ShouldBe(480);
         config.Config.ShouldNotBeNull().BrowserPath.ShouldBe(@"C:\Program Files\Google\Chrome\Application\chrome.exe");
     }
 
@@ -89,6 +97,10 @@ public sealed class ConfigReaderTests : IDisposable
                      okta:
                        default:
                          okta_domain: https://test.okta.com/
+
+                   credentials:
+                     test_profile:
+                       role_arn: arn:aws:iam::123:role:/test_role
                    """;
 
         var filePath = CreateTempFile(yaml);
@@ -96,6 +108,7 @@ public sealed class ConfigReaderTests : IDisposable
         var config = _configReader.Read(filePath);
 
         config.Authentication.ShouldNotBeNull().Okta["default"].RememberSession.ShouldBeNull();
+        config.Credentials["test_profile"].SessionDuration.ShouldBeNull();
     }
 
     [Fact]
