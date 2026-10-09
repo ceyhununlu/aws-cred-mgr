@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Ellosoft Limited. All rights reserved.
 
 using System.Diagnostics;
+using System.Text.Json.Nodes;
 using Ellosoft.AwsCredentialsManager.Services.Okta.Exceptions;
 using Microsoft.Extensions.Logging;
 
@@ -77,6 +78,9 @@ public sealed class ChromiumBrowser : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // read the PID before Browser.close: a reused leftover browser has no Process handle of our own
+        var browserPid = await TryGetBrowserProcessIdAsync();
+
         if (!Connection.IsClosed)
         {
             try
@@ -92,13 +96,20 @@ public sealed class ChromiumBrowser : IAsyncDisposable
 
         await Connection.DisposeAsync();
 
-        if (_process is null)
+        var process = _process ?? TryGetProcessById(browserPid);
+
+        if (process is null)
             return;
 
-        if (!await WaitForExitAsync(_process, TimeSpan.FromSeconds(5)))
-            KillProcess(_process, _logger);
-
-        _process.Dispose();
+        try
+        {
+            if (!await WaitForExitAsync(process, TimeSpan.FromSeconds(5)))
+                KillProcess(process, _logger);
+        }
+        finally
+        {
+            process.Dispose();
+        }
     }
 
     private static Process StartProcess(string executablePath, string userDataDirectory, BrowserLaunchOptions options, ILogger logger)
@@ -145,7 +156,10 @@ public sealed class ChromiumBrowser : IAsyncDisposable
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-search-engine-choice-screen",
-            "--hide-crash-restore-bubble"
+            "--hide-crash-restore-bubble",
+            // Edge Startup Boost / Chrome background mode keep a windowless process that would leave the profile locked
+            "--disable-background-mode",
+            "--disable-features=TranslateUI,BackgroundMode,msStartupBoost"
         };
 
         if (options.Headless)
@@ -226,6 +240,50 @@ public sealed class ChromiumBrowser : IAsyncDisposable
             return null;
 
         return new Uri($"ws://127.0.0.1:{port}{lines[1].Trim()}");
+    }
+
+    /// <summary>
+    ///     Browser process id from the DevTools protocol, used to stop a leftover browser we reused (no Process handle)
+    /// </summary>
+    private async Task<int?> TryGetBrowserProcessIdAsync()
+    {
+        if (Connection.IsClosed)
+            return null;
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            var result = await Connection.SendAsync("SystemInfo.getProcessInfo", cancellationToken: timeout.Token);
+
+            var browser = (result["processInfo"] as JsonArray)?
+                .OfType<JsonObject>()
+                .FirstOrDefault(process => process["type"] is JsonValue type && type.TryGetValue<string>(out var name) &&
+                                           name.Equals("browser", StringComparison.OrdinalIgnoreCase));
+
+            if (browser?["id"] is JsonValue id && id.TryGetValue<int>(out var pid) && pid > 0)
+                return pid;
+        }
+        catch (Exception e) when (e is CdpException or OperationCanceledException)
+        {
+            _logger.LogDebug(e, "Unable to read the browser process id");
+        }
+
+        return null;
+    }
+
+    private static Process? TryGetProcessById(int? processId)
+    {
+        if (processId is not > 0)
+            return null;
+
+        try
+        {
+            return Process.GetProcessById(processId.Value);
+        }
+        catch (Exception e) when (e is ArgumentException or InvalidOperationException)
+        {
+            return null;
+        }
     }
 
     private static async Task<bool> WaitForExitAsync(Process process, TimeSpan timeout)

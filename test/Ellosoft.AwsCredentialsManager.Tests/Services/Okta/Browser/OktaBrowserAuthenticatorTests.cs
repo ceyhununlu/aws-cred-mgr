@@ -80,6 +80,8 @@ public sealed class OktaBrowserAuthenticatorTests : IAsyncLifetime
 
         _oktaSite.SignIns.ShouldBe([(Username, Password)]);
         _console.Output.ShouldContain("Authenticated!");
+
+        await ShouldHaveClosedTheBrowserAsync();
     }
 
     [Fact]
@@ -96,6 +98,8 @@ public sealed class OktaBrowserAuthenticatorTests : IAsyncLifetime
         result.SessionCookies.ShouldNotBeNull().GetCookieHeader(_oktaSite.OktaDomain).ShouldContain($"sid={FakeOktaSite.SessionId}");
 
         _oktaSite.SignIns.ShouldBe([(Username, Password)]);
+
+        await ShouldHaveClosedTheBrowserAsync();
     }
 
     [Fact]
@@ -130,6 +134,16 @@ public sealed class OktaBrowserAuthenticatorTests : IAsyncLifetime
             SignInTimeout = signInTimeout,
             ProfileDirectory = _profileDirectory
         };
+    }
+
+    private async Task ShouldHaveClosedTheBrowserAsync()
+    {
+        // a leftover browser would be reused (IsNewInstance == false); a closed one starts a new process
+        await using var leftover = await ChromiumBrowser.LaunchAsync(BrowserPath!, _profileDirectory,
+            new BrowserLaunchOptions { Headless = true, ExtraArguments = GetTestBrowserArguments() },
+            NullLogger.Instance, TestContext.Current.CancellationToken);
+
+        leftover.IsNewInstance.ShouldBeTrue("the sign-in browser should have been closed after authentication");
     }
 
     private static List<string> GetTestBrowserArguments()

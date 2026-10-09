@@ -63,7 +63,10 @@ public class OktaBrowserAuthenticator(
 
             try
             {
-                var result = await new SignInFlow(browser, request, sessionClient, logger).RunAsync(timeout.Token);
+                var signIn = new SignInFlow(browser, request, sessionClient, logger);
+                var result = await signIn.RunAsync(timeout.Token);
+
+                await signIn.CloseSignInTabAsync();
 
                 console.MarkupLine("\r\n[bold green]Authenticated![/]\r\n");
 
@@ -145,7 +148,7 @@ public class OktaBrowserAuthenticator(
             <html><head><meta charset="utf-8"><title>aws-cred-mgr</title></head>
             <body style="font-family: sans-serif; margin: 3em">
               <h2>You are signed in</h2>
-              <p>aws-cred-mgr received your AWS sign-in, you can return to the terminal.</p>
+              <p>aws-cred-mgr received your AWS sign-in, this tab is closing.</p>
             </body></html>
             """;
 
@@ -260,12 +263,28 @@ public class OktaBrowserAuthenticator(
             }
         }
 
+        public async Task CloseSignInTabAsync()
+        {
+            if (_targetId.Length == 0 || _cdp.IsClosed)
+                return;
+
+            try
+            {
+                using var closeTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                await _cdp.SendAsync("Target.closeTarget", new JsonObject { ["targetId"] = _targetId }, cancellationToken: closeTimeout.Token);
+            }
+            catch (Exception e) when (e is CdpException or OperationCanceledException)
+            {
+                logger.LogDebug(e, "Unable to close the Okta sign-in tab");
+            }
+        }
+
         private async Task AttachToPageAsync(CancellationToken cancellationToken)
         {
             string? targetId = null;
 
-            // a new browser opens with an about:blank tab (launch argument), use it instead of opening a second window
-            for (var attempt = 0; browser.IsNewInstance && targetId is null && attempt < 20; attempt++)
+            // reuse the about:blank tab of a new browser, or the leftover tab of a browser still running with this profile
+            for (var attempt = 0; targetId is null && attempt < 20; attempt++)
             {
                 var targets = await _cdp.SendAsync("Target.getTargets", cancellationToken: cancellationToken);
 
@@ -282,7 +301,7 @@ public class OktaBrowserAuthenticator(
             if (targetId is null)
             {
                 var newTarget = await _cdp.SendAsync("Target.createTarget",
-                    new JsonObject { ["url"] = "about:blank", ["newWindow"] = true }, cancellationToken: cancellationToken);
+                    new JsonObject { ["url"] = "about:blank", ["newWindow"] = false }, cancellationToken: cancellationToken);
 
                 targetId = GetString(newTarget["targetId"]) ?? throw new OktaBrowserSignInException("Unable to open a browser tab for the Okta sign-in");
             }

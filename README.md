@@ -119,13 +119,14 @@ On Windows, Okta usually signs FastPass users in through the browser: the Okta s
 Okta Verify itself. That flow cannot be reproduced outside a browser, so on Windows `--mfa fastpass` (and any profile
 with `auth_type: browser`, on any OS) signs in through **Microsoft Edge** or **Google Chrome**:
 
-1. `aws-cred-mgr` opens a browser window with its own browser profile (`~/.aws_cred_mgr/browser-profile`), separate
-   from your everyday browser profile.
+1. `aws-cred-mgr` opens a dedicated Edge or Chrome window with its own browser profile (`~/.aws_cred_mgr/browser-profile`),
+   not a tab in the browser you already have open. Chromium only allows remote debugging (used to read the sign-in
+   result) on a browser process we start ourselves, and a separate profile always gets its own window.
 2. The Okta sign-in page opens (your username, and your saved password if any, are filled in for you on your Okta
    domain only). Complete the sign-in as usual: when Okta asks for FastPass, the page opens Okta Verify. The first time,
    allow the browser to open Okta Verify and, if asked, to access apps on this device (tick "Always allow").
 3. Once Okta signs you in to the AWS app, `aws-cred-mgr` picks up the SAML response (the browser does not continue to
-   the AWS console), saves the Okta session and closes the window.
+   the AWS console), saves the Okta session and **closes that window**.
 
 Because the browser profile keeps its own Okta cookies, the next browser sign-in often completes on its own. Use
 `browser_path` in the `config` section to choose the browser. If your organization disables browser remote debugging
